@@ -91,6 +91,26 @@ config:
         walk_seed: true
         guidance_scale: 4
         sample_steps: 20
+        # Optional: stack extra loras onto EVERY sample so they look closer to
+        # your production setup (e.g. a turbo lora + a style lora). Each entry is
+        # a path (local file/dir or HF repo id) and a weight. These are only used
+        # for sampling — they never affect the lora being trained.
+#        loras:
+#          - path: "/path/to/turbo.safetensors"
+#            weight: 1.0
+#          - path: "/path/to/style.safetensors"
+#            weight: 0.8
+        # You can also set loras per-sample using the `samples:` form instead of
+        # `prompts:` above. A sample's own `loras` overrides the global list;
+        # give it `loras: []` to disable extra loras for that one sample:
+#        samples:
+#          - prompt: "[trigger] on a mountain, golden hour"          # uses the global loras
+#          - prompt: "[trigger] studio portrait, white backdrop"
+#            loras:
+#              - path: "/path/to/style.safetensors"
+#                weight: 1.0
+#          - prompt: "[trigger] raw, no style"
+#            loras: []                                                # no extra loras
 # you can add any additional meta info here. [name] is replaced with config name at top
 meta:
   name: "[name]"

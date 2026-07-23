@@ -41,6 +41,45 @@ class LoggingConfig:
         self.project_name: str = kwargs.get('project_name', 'ai-toolkit')
         self.run_name: str = kwargs.get('run_name', None)
 
+class SampleLora:
+    """An extra LoRA to stack onto the base model when generating samples.
+
+    Lets samples look closer to the final production result (e.g. a turbo LoRA
+    plus a style LoRA) without affecting what is being trained. `path` is a local
+    file/dir or a HF repo id; `weight` is the LoRA multiplier at generation time.
+    """
+
+    def __init__(self, **kwargs):
+        self.path: Optional[str] = kwargs.get('path', kwargs.get('name', None))
+        weight = kwargs.get('weight', kwargs.get('multiplier', 1.0))
+        try:
+            self.weight: float = float(weight)
+        except (TypeError, ValueError):
+            print(f"Invalid sample lora weight {weight!r}, defaulting to 1.0")
+            self.weight = 1.0
+        if not self.path:
+            raise ValueError("A sample lora entry requires a 'path'")
+
+
+def parse_sample_loras(raw) -> List['SampleLora']:
+    """Normalise a `loras` config value into SampleLora objects.
+
+    Accepts a list of strings ("path"), dicts ({path, weight}) or SampleLora
+    objects. `None` yields an empty list.
+    """
+    loras: List[SampleLora] = []
+    for item in raw or []:
+        if isinstance(item, SampleLora):
+            loras.append(item)
+        elif isinstance(item, str):
+            loras.append(SampleLora(path=item))
+        elif isinstance(item, dict):
+            loras.append(SampleLora(**item))
+        else:
+            raise ValueError(f"Invalid sample lora entry: {item!r}")
+    return loras
+
+
 class SampleItem:
     def __init__(
         self,
@@ -76,6 +115,13 @@ class SampleItem:
         # only for models that support it, (qwen image edit 2509 for now)
         self.do_cfg_norm: bool = kwargs.get('do_cfg_norm', False)
 
+        # extra loras to stack for this sample. If not given, inherit the ones
+        # configured for all samples on the SampleConfig.
+        if 'loras' in kwargs:
+            self.loras: List[SampleLora] = parse_sample_loras(kwargs.get('loras'))
+        else:
+            self.loras = sample_config.loras
+
 class SampleConfig:
     def __init__(self, **kwargs):
         self.sampler: str = kwargs.get('sampler', 'ddpm')
@@ -100,7 +146,11 @@ class SampleConfig:
         if self.num_frames > 1 and self.ext not in ['webp']:
             print("Changing sample extention to animated webp")
             self.ext = 'webp'
-        
+
+        # extra loras stacked onto every sample (unless a sample overrides them),
+        # e.g. a turbo lora + a style lora so samples match the production setup.
+        self.loras: List[SampleLora] = parse_sample_loras(kwargs.get('loras', []))
+
         prompts: list[str] = kwargs.get('prompts', [])
         
         self.samples: Optional[List[SampleItem]] = None
@@ -1124,6 +1174,7 @@ class GenerateImageConfig:
             fps: int = 15,
             ctrl_idx: int = 0,
             do_cfg_norm: bool = False,
+            loras: Optional[List['SampleLora']] = None,
     ):
         self.width: int = width
         self.height: int = height
@@ -1193,8 +1244,11 @@ class GenerateImageConfig:
         self.width = max(64, self.width - self.width % 8)  # round to divisible by 8
 
         self.logger = logger
-        
+
         self.do_cfg_norm: bool = do_cfg_norm
+
+        # extra loras to stack on the pipeline for this sample (path + weight)
+        self.loras: List['SampleLora'] = loras if loras is not None else []
 
     def set_gen_time(self, gen_time: int = None):
         if gen_time is not None:

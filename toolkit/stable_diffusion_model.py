@@ -1371,6 +1371,28 @@ class StableDiffusion:
         if network is not None:
             start_multiplier = network.multiplier
 
+        # --- extra sample loras -------------------------------------------------
+        # Stack user-provided loras (e.g. a turbo + a style lora) on the pipeline
+        # so samples look closer to the production result. They are loaded as named
+        # diffusers adapters here, selected per-sample inside the loop, and fully
+        # unloaded afterwards so training weights are untouched. No-op when unused.
+        sample_lora_adapters = {}  # path -> adapter_name
+        try:
+            unique_lora_paths = []
+            for cfg in image_configs:
+                for lora in getattr(cfg, 'loras', []) or []:
+                    if lora.path not in unique_lora_paths:
+                        unique_lora_paths.append(lora.path)
+            for idx, lora_path in enumerate(unique_lora_paths):
+                adapter_name = f"sample_lora_{idx}"
+                pipeline.load_lora_weights(lora_path, adapter_name=adapter_name)
+                sample_lora_adapters[lora_path] = adapter_name
+            if sample_lora_adapters:
+                print_acc(f"Loaded {len(sample_lora_adapters)} extra sample lora(s)")
+        except Exception as e:
+            print_acc(f"Failed to load extra sample loras, skipping them: {e}")
+            sample_lora_adapters = {}
+
         # pipeline.to(self.device_torch)
 
         with network:
@@ -1426,6 +1448,23 @@ class StableDiffusion:
 
                     if network is not None:
                         network.multiplier = gen_config.network_multiplier
+
+                    # activate this sample's extra loras (with their weights)
+                    if sample_lora_adapters:
+                        cfg_loras = getattr(gen_config, 'loras', []) or []
+                        names, weights = [], []
+                        for lora in cfg_loras:
+                            adapter_name = sample_lora_adapters.get(lora.path)
+                            if adapter_name is not None:
+                                names.append(adapter_name)
+                                weights.append(lora.weight)
+                        if names:
+                            pipeline.set_adapters(names, adapter_weights=weights)
+                            pipeline.enable_lora()
+                        else:
+                            # this sample uses none of the extra loras
+                            pipeline.disable_lora()
+
                     torch.manual_seed(gen_config.seed)
                     torch.cuda.manual_seed(gen_config.seed)
                     
@@ -1722,6 +1761,13 @@ class StableDiffusion:
 
                 if self.adapter is not None and isinstance(self.adapter, ReferenceAdapter):
                     self.adapter.clear_memory()
+
+        # remove the extra sample loras so training weights are left untouched
+        if sample_lora_adapters:
+            try:
+                pipeline.unload_lora_weights()
+            except Exception as e:
+                print_acc(f"Failed to unload extra sample loras: {e}")
 
         # clear pipeline and cache to reduce vram usage
         del pipeline
