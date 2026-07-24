@@ -283,29 +283,6 @@ class BaseModel:
         raise NotImplementedError(
             "load_model must be implemented in child classes")
 
-    def try_increase_layer_offload(self, step: float = 0.1):
-        """Raise the transformer layer-offload level to recover from an OOM.
-
-        Default: not supported -> returns None and the trainer keeps its normal
-        OOM handling. Models that support auto offloading (e.g. krea2) override
-        this to detach/re-attach the memory manager at a higher percent.
-        """
-        return None
-
-    def try_decrease_layer_offload(self, step: float = 0.05):
-        """Lower the offload level (more resident on GPU) to go faster when
-        VRAM headroom allows. Default: unsupported -> None."""
-        return None
-
-    def get_layer_offload_percent(self):
-        """Current transformer offload percent, or None if not offloading."""
-        return None
-
-    def get_transformer_weight_gb(self):
-        """Total transformer weight footprint in GB, used to size the adaptive
-        offload step proportionally (GB <-> percent). None if unknown."""
-        return None
-
     # --- sample loras (stack extra loras on generated samples) --------------
     # Default: unsupported -> no-op. Models with their own lora system (e.g.
     # krea2) override these to load/activate the loras carried on each

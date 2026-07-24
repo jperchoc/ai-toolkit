@@ -422,123 +422,6 @@ class BaseSDTrainProcess(BaseTrainProcess):
         except Exception as e:  # noqa: BLE001 - reporting must never break training
             print_acc(f"[vram] report failed: {e}")
 
-    def _adaptive_offload_tick(self, did_oom):
-        """In auto offload mode, CONTINUOUSLY regulate the offload to use the card
-        fully while staying safe — no permanent latch, so it adapts to per-step
-        VRAM changes (e.g. multi-resolution buckets). Asymmetric on purpose:
-        - RAISE fast, reacting to the CURRENT peak, as soon as free VRAM at peak
-          drops below the target margin (a big bucket just ran) -> avoids OOM.
-        - LOWER cautiously: only when the WORST peak over several recent windows
-          still has clear extra room, so a light bucket doesn't tempt a level that
-          the next heavy bucket would OOM.
-        Step size is proportional to the VRAM gap. Only runs when
-        layer_offloading_transformer_percent: auto. Disable with
-        AITK_ADAPTIVE_OFFLOAD=0; set the free margin with AITK_OFFLOAD_HEADROOM_GB
-        (default 0.6)."""
-        try:
-            # Re-tuning is OFF unless layer_offloading_adjust_every > 0. When off,
-            # the offload never changes mid-run (no memory-manager re-attach), which
-            # is rock-solid; the starting value (numeric or "auto") is used as-is.
-            adjust_every = int(
-                getattr(self.model_config, "layer_offloading_adjust_every", 0) or 0
-            )
-            if not self.model_config.layer_offloading or adjust_every <= 0:
-                return
-            if os.environ.get("AITK_ADAPTIVE_OFFLOAD", "1") == "0":
-                return
-            cur = self.sd.get_layer_offload_percent()
-            if cur is None:
-                return
-
-            tuner = getattr(self, "_offload_tuner", None)
-            if tuner is None:
-                try:
-                    headroom_gb = float(os.environ.get("AITK_OFFLOAD_HEADROOM_GB", "0.6"))
-                except ValueError:
-                    headroom_gb = 0.6
-                tuner = {
-                    "seen": 0, "steps_since": 0, "warmup": 6, "interval": adjust_every,
-                    "min_step": 0.02, "damping": 0.7, "headroom_gb": headroom_gb,
-                    # lowering is cautious: needs this much EXTRA room, and this
-                    # many consecutive comfortable windows, before it lowers.
-                    "lower_margin_gb": 0.8, "lower_patience": 3,
-                    "comfortable": 0, "peak_history": [],
-                }
-                self._offload_tuner = tuner
-
-            tuner["seen"] += 1
-            if did_oom:
-                # OOM recovery already raised the level; forget recent (now stale)
-                # peaks and reset patience so we don't lower again immediately.
-                tuner["peak_history"] = []
-                tuner["comfortable"] = 0
-                return
-            if tuner["seen"] < tuner["warmup"]:
-                return
-            tuner["steps_since"] += 1
-            if tuner["steps_since"] < tuner["interval"]:
-                return
-            tuner["steps_since"] = 0
-
-            from toolkit.memory_management import gpu_mem_gb
-
-            device = self.device_torch
-            total, _ = gpu_mem_gb(device)
-            if total is None:
-                return
-            cur_peak = torch.cuda.max_memory_allocated(device) / (1024 ** 3)
-            torch.cuda.reset_peak_memory_stats(device)
-
-            # rolling worst-case peak over the last few windows (captures the
-            # heaviest recent bucket, not just this window's)
-            hist = tuner["peak_history"]
-            hist.append(cur_peak)
-            if len(hist) > 4:
-                hist.pop(0)
-            worst_peak = max(hist)
-
-            headroom_gb = tuner["headroom_gb"]
-            free_now = total - cur_peak       # margin on the CURRENT window
-            free_worst = total - worst_peak   # margin on the worst recent window
-            weight_gb = self.sd.get_transformer_weight_gb()
-
-            def step_for(gb):
-                if weight_gb and weight_gb > 0:
-                    return max(
-                        tuner["min_step"],
-                        min(0.5, abs(gb) / weight_gb * tuner["damping"]),
-                    )
-                return 0.05  # fallback if the model can't report its size
-
-            if free_now < headroom_gb and cur < 1.0:
-                # too close to the limit right now -> raise immediately
-                deficit = headroom_gb - free_now
-                new_pct = self.sd.try_increase_layer_offload(step_for(deficit) + 0.02)
-                tuner["comfortable"] = 0
-                if new_pct is not None:
-                    print_acc(
-                        f"[adaptive-offload] only {free_now:.1f}GB free "
-                        f"-> offload {new_pct * 100:.0f}% (safer)"
-                    )
-            elif free_worst > headroom_gb + tuner["lower_margin_gb"] and cur > 0.0:
-                # even the heaviest recent window has clear room -> maybe lower,
-                # but only after a few consecutive comfortable checks
-                tuner["comfortable"] += 1
-                if tuner["comfortable"] >= tuner["lower_patience"]:
-                    tuner["comfortable"] = 0
-                    spare = free_worst - headroom_gb
-                    new_pct = self.sd.try_decrease_layer_offload(step_for(spare))
-                    if new_pct is not None:
-                        print_acc(
-                            f"[adaptive-offload] {free_worst:.1f}GB free (worst) "
-                            f"-> offload {new_pct * 100:.0f}% (faster)"
-                        )
-            else:
-                # within the target band -> hold, keep watching
-                tuner["comfortable"] = 0
-        except Exception as e:  # noqa: BLE001 - tuning must never break training
-            print_acc(f"[adaptive-offload] tick failed: {e}")
-
     def update_training_metadata(self):
         o_dict = OrderedDict({
             "training_info": self.get_training_info()
@@ -2808,28 +2691,14 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 optimizer.zero_grad(set_to_none=True)
                 flush()
                 torch.cuda.ipc_collect()
-                # Only re-attach the memory manager (raise offload) if adaptive
-                # re-tuning is explicitly enabled; otherwise just skip the batch —
-                # mid-run re-attach is experimental and can corrupt device placement.
-                new_pct = None
-                if int(getattr(self.model_config, "layer_offloading_adjust_every", 0) or 0) > 0:
-                    try:
-                        new_pct = self.sd.try_increase_layer_offload()
-                    except Exception as e:  # noqa: BLE001
-                        print_acc(f"# auto-offload recovery failed: {e}")
                 # skip this step and keep going
                 print_acc("")
                 print_acc("################################################")
                 print_acc(f"# OOM during training step, skipping batch {self.num_consecutive_oom}/3 #")
-                if new_pct is not None:
-                    print_acc(f"# auto-offload: raised transformer offload to {new_pct*100:.0f}% #")
                 print_acc("################################################")
                 print_acc("")
             else:
                 self.num_consecutive_oom = 0
-            # adaptive offload: in auto mode, lower the offload while VRAM allows
-            # (faster) and let OOM recovery above settle it -> uses the card fully
-            self._adaptive_offload_tick(did_oom)
             if self.torch_profiler is not None:
                 torch.cuda.synchronize()  # Make sure all CUDA ops are done
                 self.torch_profiler.stop()

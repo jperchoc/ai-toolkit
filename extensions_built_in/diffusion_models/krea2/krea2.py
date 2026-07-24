@@ -263,10 +263,6 @@ class Krea2Model(BaseModel):
             self.model_config.model_kwargs.get("offline", False)
         ) or _hf_offline_from_env()
 
-        # Stored so an OOM in the training loop can raise the transformer offload
-        # level on the fly (see try_increase_layer_offload).
-        self._offload_ctx = None
-        self._transformer_weight_gb = None  # cached for proportional offload steps
 
         # Extra loras stacked on samples, applied via direct forward hooks on the
         # transformer's linear modules (NOT LoRASpecialNetwork, which wouldn't
@@ -520,12 +516,6 @@ class Krea2Model(BaseModel):
                     offload_percent=self.model_config.layer_offloading_transformer_percent,
                     ignore_modules=ignore_modules,
                 )
-                # remember how to re-attach at a higher percent to recover from OOM
-                self._offload_ctx = {
-                    "module": transformer,
-                    "device": self.device_torch,
-                    "ignore_modules": ignore_modules,
-                }
 
         if self.model_config.low_vram:
             self.print_and_status_update("Moving transformer to CPU")
@@ -611,68 +601,6 @@ class Krea2Model(BaseModel):
                 self.print_and_status_update(f"[sample-lora] loaded {p}")
             except Exception as e:  # noqa: BLE001 - never block model load
                 print(f"[sample-lora] SKIPPED {p}: {e}")
-
-    def get_layer_offload_percent(self) -> Optional[float]:
-        """Current transformer offload percent, or None if offloading is off."""
-        if not self._offload_ctx:
-            return None
-        return self.model_config.layer_offloading_transformer_percent
-
-    def get_transformer_weight_gb(self) -> Optional[float]:
-        """Total transformer weight footprint (GB), cached. Lets the adaptive
-        controller size its step proportionally: to change resident VRAM by G GB,
-        change the offload percent by ~G / weight_gb."""
-        if self._transformer_weight_gb is not None:
-            return self._transformer_weight_gb
-        m = self.get_model_to_train()
-        if m is None:
-            return None
-        seen, total = set(), 0
-        for t in list(m.parameters()) + list(m.buffers()):
-            if t is None or id(t) in seen:
-                continue
-            seen.add(id(t))
-            total += t.numel() * t.element_size()
-        self._transformer_weight_gb = total / (1024 ** 3)
-        return self._transformer_weight_gb
-
-    def _set_layer_offload_percent(self, new_percent: float) -> Optional[float]:
-        """Re-attach the memory manager at a new offload percent (best-effort).
-        Returns the applied percent, or None if not possible / failed."""
-        ctx = self._offload_ctx
-        if not ctx:
-            return None
-        new_percent = min(1.0, max(0.0, round(new_percent, 4)))
-        try:
-            MemoryManager.reattach(
-                ctx["module"],
-                ctx["device"],
-                offload_percent=new_percent,
-                ignore_modules=ctx["ignore_modules"],
-            )
-            # resident (unmanaged) layers back on the GPU; managed ones stream
-            ctx["module"].to(ctx["device"])
-            self.model_config.layer_offloading_transformer_percent = new_percent
-            flush()
-            return new_percent
-        except Exception as e:  # noqa: BLE001 - must never crash training
-            print(f"[auto-offload] failed to set transformer offload: {e}")
-            return None
-
-    def try_increase_layer_offload(self, step: float = 0.1) -> Optional[float]:
-        """Raise the offload level (more streamed from CPU) to recover from OOM."""
-        current = self.get_layer_offload_percent()
-        if current is None or current >= 1.0:
-            return None
-        return self._set_layer_offload_percent(current + step)
-
-    def try_decrease_layer_offload(self, step: float = 0.05) -> Optional[float]:
-        """Lower the offload level (more resident on GPU) to go faster when there
-        is spare VRAM."""
-        current = self.get_layer_offload_percent()
-        if current is None or current <= 0.0:
-            return None
-        return self._set_layer_offload_percent(current - step)
 
     # ------------------------------------------------------------------
     # Sample loras (stack extra loras on generated samples)

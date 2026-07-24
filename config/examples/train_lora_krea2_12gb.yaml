@@ -71,12 +71,6 @@ config:
         layer_offloading_text_encoder_percent: 1.0
         # Starting-estimate margin (GB) used only when the percent is "auto".
         layer_offloading_reserved_gb: 1.5
-        # OPTIONAL adaptive re-tuning: 0/absent = OFF (fixed offload, safest).
-        # Set a positive N to re-tune the offload every N steps to use the card
-        # more fully — EXPERIMENTAL (re-attaches the memory manager live; can be
-        # unstable with quantization/multi-resolution). Tune the free margin it
-        # keeps with AITK_OFFLOAD_HEADROOM_GB (default 0.6).
-#        layer_offloading_adjust_every: 50
         model_kwargs:
           # Offline training: load the text encoder / VAE / checkpoints from the
           # local HF cache only (no network). Uncomment if you train offline.
