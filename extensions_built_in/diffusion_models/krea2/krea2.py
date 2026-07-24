@@ -267,11 +267,11 @@ class Krea2Model(BaseModel):
         # level on the fly (see try_increase_layer_offload).
         self._offload_ctx = None
 
-        # Extra loras stacked on samples (path -> LoRASpecialNetwork). Built at
-        # LOAD time (same point the training network attaches) and reused across
-        # sample steps; sampling only toggles their weight. See load_model /
-        # prepare_sample_loras.
-        self._sample_lora_networks = {}
+        # Extra loras stacked on samples, applied via direct forward hooks on the
+        # transformer's linear modules (NOT LoRASpecialNetwork, which wouldn't
+        # attach here). path -> handle dict {multiplier, active, handles, matched}.
+        # Hooks are inert unless active + multiplier != 0, so training is untouched.
+        self._sample_lora_handles = {}
         self._pending_sample_lora_paths = []
 
     @staticmethod
@@ -603,10 +603,10 @@ class Krea2Model(BaseModel):
     def _build_pending_sample_loras(self) -> None:
         paths = getattr(self, "_pending_sample_lora_paths", None) or []
         for p in paths:
-            if p in self._sample_lora_networks:
+            if p in self._sample_lora_handles:
                 continue
             try:
-                self._sample_lora_networks[p] = self._load_sample_lora_network(p)
+                self._sample_lora_handles[p] = self._load_sample_lora_hooks(p)
                 self.print_and_status_update(f"[sample-lora] loaded {p}")
             except Exception as e:  # noqa: BLE001 - never block model load
                 print(f"[sample-lora] SKIPPED {p}: {e}")
@@ -674,195 +674,113 @@ class Krea2Model(BaseModel):
             local_files_only=self.offline,
         )
 
-    @staticmethod
-    def _key_mapping_candidates(raw_sd: dict) -> list:
-        """Candidate prefix remaps to try (label, state_dict). We keep whichever
-        matches the most of the model's lora modules — so we don't have to know
-        the exact export format of a ComfyUI/kohya/diffusers krea2 lora up front."""
-        def remap(a, b):
-            return {k.replace(a, b): v for k, v in raw_sd.items()}
-        return [
-            ("as-is", dict(raw_sd)),
-            ("diffusion_model.->transformer.", remap("diffusion_model.", "transformer.")),
-            ("model.diffusion_model.->transformer.", remap("model.diffusion_model.", "transformer.")),
-            ("lora_unet_->transformer.", remap("lora_unet_", "transformer.")),
-            ("strip transformer.", remap("transformer.", "")),
-        ]
+    def _load_sample_lora_hooks(self, lora_path: str) -> dict:
+        """Apply an extra sample lora via direct forward hooks on the transformer's
+        linear modules. Bypasses LoRASpecialNetwork entirely (which fails to attach
+        here). We match each lora weight pair to a module by name ourselves, so it
+        attaches to the modules the DIAG confirmed exist. The hooks are inert
+        unless the returned handle is active with a non-zero multiplier, so they
+        only affect sampling — never training."""
+        from toolkit.lora_special import LINEAR_MODULES
 
-    def _load_sample_lora_network(self, lora_path: str) -> "LoRASpecialNetwork":
-        """Build a LoRASpecialNetwork for an extra sample lora, applied to the
-        transformer but inactive (multiplier 0), using the same machinery as the
-        training network. Diagnoses a zero-module attach, and tries several key
-        mappings, keeping the one that matches the most weights."""
         resolved = self._resolve_lora_path(lora_path)
         name = os.path.basename(resolved)
         raw_sd = load_file(resolved)
-
-        # detect the lora rank from any plausible down/A weight
-        down_key = next(
-            (
-                k for k in raw_sd
-                if k.endswith("lora_A.weight")
-                or k.endswith("lora_down.weight")
-                or k.endswith(".lora.down.weight")
-            ),
-            None,
-        )
-        if down_key is None:
-            sample_keys = list(raw_sd.keys())[:6]
-            raise ValueError(
-                f"{name}: no lora_A/lora_down weight found — unrecognised lora "
-                f"format. First keys: {sample_keys}"
-            )
-        dim = int(raw_sd[down_key].shape[0])
-
-        LoRASpecialNetwork.LORA_PREFIX_UNET = "lora_transformer"
         transformer = self.get_model_to_train()
 
-        # ALWAYS log the transformer structure (cheap) so an attach failure is
-        # diagnosable in ONE run instead of a bare "no lora modules".
-        from toolkit.lora_special import LINEAR_MODULES
-
-        linear_present, sample_names = {}, []
-        for nm, mod in transformer.named_modules():
-            cn = mod.__class__.__name__
-            if cn in LINEAR_MODULES:
-                linear_present[cn] = linear_present.get(cn, 0) + 1
-                if len(sample_names) < 8:
-                    sample_names.append(nm)
-        print(
-            f"[sample-lora] {name}: DIAG root={transformer.__class__.__name__} "
-            f"target={self.target_lora_modules} linear_modules={linear_present} "
-            f"sample_linear_names={sample_names}"
+        # name -> linear module, plus an underscore-form lookup (kohya keys use _)
+        mods = {
+            nm: m
+            for nm, m in transformer.named_modules()
+            if nm and m.__class__.__name__ in LINEAR_MODULES
+        }
+        und = {nm.replace(".", "_"): nm for nm in mods}
+        _PREFIXES = (
+            "transformer.", "diffusion_model.", "model.diffusion_model.",
+            "lora_transformer_", "lora_unet_", "lora_",
         )
 
-        # PROBE: replicate create_modules' outer/inner matching by hand so we see
-        # exactly why LoRASpecialNetwork ends up with 0 modules. If would_create>0
-        # here but the network still builds 0, the divergence is inside
-        # LoRASpecialNetwork (a skip we haven't spotted); if would_create==0 the
-        # target/class matching itself is wrong.
-        try:
-            from toolkit.lorm import count_parameters
+        def resolve(core: str):
+            if core in mods:
+                return core
+            if core in und:
+                return und[core]
+            for pre in _PREFIXES:
+                if core.startswith(pre):
+                    c = core[len(pre):]
+                    if c in mods:
+                        return c
+                    if c in und:
+                        return und[c]
+                    cu = c.replace(".", "_")
+                    if cu in und:
+                        return und[cu]
+            return None
 
-            tgts = self.target_lora_modules
-            root_matches = sum(
-                1 for _, m in transformer.named_modules()
-                if m.__class__.__name__ in tgts
-            )
-            would_create, probe = 0, []
-            for _, container in transformer.named_modules():
-                if container.__class__.__name__ in tgts:
-                    for cn, cm in container.named_modules():
-                        if cm.__class__.__name__ in LINEAR_MODULES:
-                            would_create += 1
-                            if len(probe) < 3:
-                                probe.append(
-                                    f"{cn}[{cm.__class__.__name__}] "
-                                    f"params={count_parameters(cm)}"
-                                )
-            print(
-                f"[sample-lora] {name}: PROBE target_class_matches={root_matches} "
-                f"would_create~{would_create} first={probe}"
-            )
-        except Exception as e:  # noqa: BLE001
-            print(f"[sample-lora] {name}: PROBE failed: {e}")
+        _DOWN = (".lora_down.weight", ".lora_A.weight", ".lora.down.weight")
+        _UP = (".lora_up.weight", ".lora_B.weight", ".lora.up.weight")
+        pairs, alphas = {}, {}
+        for k, v in raw_sd.items():
+            slot = suf = None
+            for s in _DOWN:
+                if k.endswith(s):
+                    slot, suf = "down", s
+                    break
+            if slot is None:
+                for s in _UP:
+                    if k.endswith(s):
+                        slot, suf = "up", s
+                        break
+            if slot is not None:
+                nm = resolve(k[: -len(suf)])
+                if nm is not None:
+                    pairs.setdefault(nm, {})[slot] = v
+            elif k.endswith(".alpha"):
+                nm = resolve(k[: -len(".alpha")])
+                if nm is not None:
+                    try:
+                        alphas[nm] = float(v)
+                    except Exception:  # noqa: BLE001
+                        pass
 
-        def build(target_lin_modules, transformer_only):
-            # network build populates unet_loras in __init__; apply_to (forward
-            # patching) is done later only on the chosen network.
-            nc = NetworkConfig(
-                type="lora", linear=dim, linear_alpha=dim,
-                transformer_only=transformer_only,
-            )
-            net = LoRASpecialNetwork(
-                text_encoder=None,
-                unet=transformer,
-                lora_dim=nc.linear,
-                multiplier=0.0,
-                alpha=nc.linear_alpha,
-                train_unet=True,
-                train_text_encoder=False,
-                network_config=nc,
-                network_type=nc.type,
-                transformer_only=transformer_only,
-                is_transformer=self.is_transformer,
-                base_model=self,
-                target_lin_modules=target_lin_modules,
-                is_assistant_adapter=True,
-            )
-            return net, len(getattr(net, "unet_loras", []) or [])
+        handle = {"multiplier": 0.0, "active": False, "handles": [], "matched": 0}
 
-        # Try, in order: configured target, then the transformer's own root class;
-        # each with the block-only filter ON then OFF. transformer_only=False drops
-        # the "blocks" name filter (the usual reason nothing attaches). Extra
-        # linears that get no loaded weight stay zero -> no effect, so this is safe.
-        targets = [self.target_lora_modules, [transformer.__class__.__name__]]
-        strategies = []
-        for t in targets:
-            for tonly in (True, False):
-                if t and (t, tonly) not in strategies:
-                    strategies.append((t, tonly))
+        def make_hook(down, up, scale):
+            def hook(module, inputs, output):
+                if not handle["active"] or handle["multiplier"] == 0.0:
+                    return output
+                x = inputs[0]
+                d = F.linear(x, down.to(x.device, x.dtype))
+                delta = F.linear(d, up.to(x.device, x.dtype))
+                return output + delta * (scale * handle["multiplier"])
+            return hook
 
-        network, n_modules = None, 0
-        for t, tonly in strategies:
-            try:
-                net, n = build(t, tonly)
-            except Exception as e:  # noqa: BLE001 - a 0-module build can raise here
-                print(
-                    f"[sample-lora] {name}: target={t} transformer_only={tonly} "
-                    f"errored: {e}"
-                )
+        for nm, parts in pairs.items():
+            if "down" not in parts or "up" not in parts:
                 continue
-            print(
-                f"[sample-lora] {name}: target={t} transformer_only={tonly} "
-                f"-> {n} modules"
-            )
-            if n > 0:
-                network, n_modules = net, n
-                break
+            down, up = parts["down"], parts["up"]
+            rank = down.shape[0]
+            scale = (float(alphas.get(nm, rank)) / float(rank)) if rank else 1.0
+            h = mods[nm].register_forward_hook(make_hook(down, up, scale))
+            handle["handles"].append(h)
+            handle["matched"] += 1
 
-        if network is None or n_modules == 0:
+        print(
+            f"[sample-lora] {name}: hooked {handle['matched']} modules "
+            f"(lora weight pairs={len(pairs)}, keys={len(raw_sd)})"
+        )
+        if handle["matched"] == 0:
             raise ValueError(
-                f"{name}: attached 0 lora modules with every strategy. "
-                f"root={transformer.__class__.__name__} "
-                f"linear_modules={linear_present} sample_names={sample_names}"
+                f"{name}: no lora keys matched model modules. "
+                f"lora keys sample={list(raw_sd.keys())[:6]} "
+                f"module names sample={list(mods)[:4]}"
             )
-
-        network.apply_to(None, transformer, apply_text_encoder=False, apply_unet=True)
-        network.force_to(self.device_torch, dtype=self.torch_dtype)
-        network._update_torch_multiplier()
-
-        # try each key mapping, keep the one that matches the most weights
-        best_label, best_matched, best_sd = None, -1, None
-        for label, sd in self._key_mapping_candidates(raw_sd):
-            try:
-                extra = network.load_weights(sd)
-                matched = len(sd) - (0 if extra is None else len(extra))
-            except Exception as e:  # noqa: BLE001
-                print(f"[sample-lora] {name}: mapping '{label}' errored: {e}")
-                continue
-            print(f"[sample-lora] {name}: mapping '{label}' matched {matched}/{len(sd)} keys")
-            if matched > best_matched:
-                best_label, best_matched, best_sd = label, matched, sd
-
-        if not best_sd or best_matched <= 0:
-            raise ValueError(
-                f"{name}: no key mapping matched any lora module — the lora will "
-                "have no effect. Send the first keys so a mapping can be added."
-            )
-        # apply the winning mapping as the final state
-        network.load_weights(best_sd)
-        print(f"[sample-lora] {name}: using mapping '{best_label}' ({best_matched} keys)")
-
-        network.is_active = False
-        network.multiplier = 0.0
-        network._update_torch_multiplier()
-        return network
+        return handle
 
     def prepare_sample_loras(self, image_configs) -> bool:
         """Best-effort: build/activate the extra sample loras. Any failure is
-        logged and skipped — it must never abort training (a run costs minutes).
-        Returns True if at least one lora is active."""
+        logged and skipped — it must never abort training. Returns True if at
+        least one lora is active."""
         try:
             paths = []
             for cfg in image_configs:
@@ -872,18 +790,17 @@ class Krea2Model(BaseModel):
             if not paths:
                 return False
             for p in paths:
-                if p in self._sample_lora_networks:
+                if p in self._sample_lora_handles:
                     continue
                 try:
-                    self._sample_lora_networks[p] = self._load_sample_lora_network(p)
+                    self._sample_lora_handles[p] = self._load_sample_lora_hooks(p)
                     self.print_and_status_update(f"[sample-lora] loaded {p}")
                 except Exception as e:  # noqa: BLE001
                     print(f"[sample-lora] SKIPPED {p}: {e}")
             active = False
-            for net in self._sample_lora_networks.values():
-                net.is_active = True
-                net.multiplier = 0.0
-                net._update_torch_multiplier()
+            for h in self._sample_lora_handles.values():
+                h["active"] = True
+                h["multiplier"] = 0.0
                 active = True
             return active
         except Exception as e:  # noqa: BLE001
@@ -896,18 +813,16 @@ class Krea2Model(BaseModel):
                 lora.path: lora.weight
                 for lora in (getattr(gen_config, "loras", []) or [])
             }
-            for path, net in self._sample_lora_networks.items():
-                net.multiplier = float(weights.get(path, 0.0))
-                net._update_torch_multiplier()
+            for path, h in self._sample_lora_handles.items():
+                h["multiplier"] = float(weights.get(path, 0.0))
         except Exception as e:  # noqa: BLE001
             print(f"[sample-lora] set weights failed: {e}")
 
     def end_sample_loras(self) -> None:
         try:
-            for net in self._sample_lora_networks.values():
-                net.multiplier = 0.0
-                net.is_active = False
-                net._update_torch_multiplier()
+            for h in self._sample_lora_handles.values():
+                h["multiplier"] = 0.0
+                h["active"] = False
         except Exception as e:  # noqa: BLE001
             print(f"[sample-lora] deactivate failed: {e}")
 
