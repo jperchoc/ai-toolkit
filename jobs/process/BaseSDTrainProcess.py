@@ -423,13 +423,18 @@ class BaseSDTrainProcess(BaseTrainProcess):
             print_acc(f"[vram] report failed: {e}")
 
     def _adaptive_offload_tick(self, did_oom):
-        """In auto offload mode, converge FAST to the offload that uses the card
-        fully: the step is PROPORTIONAL to how far peak VRAM is from the target
-        (big jumps when lots is free, small when tight), and it backs off
-        proactively if the peak gets too close to the limit. Only runs when
+        """In auto offload mode, CONTINUOUSLY regulate the offload to use the card
+        fully while staying safe — no permanent latch, so it adapts to per-step
+        VRAM changes (e.g. multi-resolution buckets). Asymmetric on purpose:
+        - RAISE fast, reacting to the CURRENT peak, as soon as free VRAM at peak
+          drops below the target margin (a big bucket just ran) -> avoids OOM.
+        - LOWER cautiously: only when the WORST peak over several recent windows
+          still has clear extra room, so a light bucket doesn't tempt a level that
+          the next heavy bucket would OOM.
+        Step size is proportional to the VRAM gap. Only runs when
         layer_offloading_transformer_percent: auto. Disable with
-        AITK_ADAPTIVE_OFFLOAD=0; set the VRAM margin to keep free with
-        AITK_OFFLOAD_HEADROOM_GB (default 0.6)."""
+        AITK_ADAPTIVE_OFFLOAD=0; set the free margin with AITK_OFFLOAD_HEADROOM_GB
+        (default 0.6)."""
         try:
             if not (
                 self.model_config.layer_offloading
@@ -449,22 +454,21 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 except ValueError:
                     headroom_gb = 0.6
                 tuner = {
-                    "converged": False, "seen": 0, "steps_since": 0,
-                    "warmup": 6, "interval": 8, "min_step": 0.02,
-                    "damping": 0.7, "band_gb": 0.3, "headroom_gb": headroom_gb,
+                    "seen": 0, "steps_since": 0, "warmup": 6, "interval": 8,
+                    "min_step": 0.02, "damping": 0.7, "headroom_gb": headroom_gb,
+                    # lowering is cautious: needs this much EXTRA room, and this
+                    # many consecutive comfortable windows, before it lowers.
+                    "lower_margin_gb": 0.8, "lower_patience": 3,
+                    "comfortable": 0, "peak_history": [],
                 }
                 self._offload_tuner = tuner
 
             tuner["seen"] += 1
-            if tuner["converged"]:
-                return
             if did_oom:
-                tuner["converged"] = True
-                now = self.sd.get_layer_offload_percent()
-                print_acc(
-                    f"[adaptive-offload] converged at {now * 100:.0f}% "
-                    "(backed off after OOM)"
-                )
+                # OOM recovery already raised the level; forget recent (now stale)
+                # peaks and reset patience so we don't lower again immediately.
+                tuner["peak_history"] = []
+                tuner["comfortable"] = 0
                 return
             if tuner["seen"] < tuner["warmup"]:
                 return
@@ -479,16 +483,23 @@ class BaseSDTrainProcess(BaseTrainProcess):
             total, _ = gpu_mem_gb(device)
             if total is None:
                 return
-            peak = torch.cuda.max_memory_allocated(device) / (1024 ** 3)
-            headroom = total - peak
-            # +spare: room to bring layers resident (go faster); -spare: over the
-            # target, peak too close to the limit (back off before OOM).
-            spare = headroom - tuner["headroom_gb"]
+            cur_peak = torch.cuda.max_memory_allocated(device) / (1024 ** 3)
+            torch.cuda.reset_peak_memory_stats(device)
+
+            # rolling worst-case peak over the last few windows (captures the
+            # heaviest recent bucket, not just this window's)
+            hist = tuner["peak_history"]
+            hist.append(cur_peak)
+            if len(hist) > 4:
+                hist.pop(0)
+            worst_peak = max(hist)
+
+            headroom_gb = tuner["headroom_gb"]
+            free_now = total - cur_peak       # margin on the CURRENT window
+            free_worst = total - worst_peak   # margin on the worst recent window
             weight_gb = self.sd.get_transformer_weight_gb()
 
             def step_for(gb):
-                # proportional: changing offload by d% moves ~d%*weight_gb of VRAM,
-                # so to move `gb` we need d = gb / weight_gb (damped, clamped).
                 if weight_gb and weight_gb > 0:
                     return max(
                         tuner["min_step"],
@@ -496,30 +507,32 @@ class BaseSDTrainProcess(BaseTrainProcess):
                     )
                 return 0.05  # fallback if the model can't report its size
 
-            if spare > tuner["band_gb"] and cur > 0.0:
-                new_pct = self.sd.try_decrease_layer_offload(step_for(spare))
+            if free_now < headroom_gb and cur < 1.0:
+                # too close to the limit right now -> raise immediately
+                deficit = headroom_gb - free_now
+                new_pct = self.sd.try_increase_layer_offload(step_for(deficit) + 0.02)
+                tuner["comfortable"] = 0
                 if new_pct is not None:
                     print_acc(
-                        f"[adaptive-offload] {headroom:.1f}GB free "
-                        f"-> offload {new_pct * 100:.0f}% (faster)"
-                    )
-                    if new_pct <= 0.0:
-                        tuner["converged"] = True  # fully resident, nothing more
-            elif spare < -tuner["band_gb"] and cur < 1.0:
-                new_pct = self.sd.try_increase_layer_offload(step_for(spare) + 0.02)
-                if new_pct is not None:
-                    print_acc(
-                        f"[adaptive-offload] only {headroom:.1f}GB free "
+                        f"[adaptive-offload] only {free_now:.1f}GB free "
                         f"-> offload {new_pct * 100:.0f}% (safer)"
                     )
-                    tuner["converged"] = True  # found the edge, settle here
+            elif free_worst > headroom_gb + tuner["lower_margin_gb"] and cur > 0.0:
+                # even the heaviest recent window has clear room -> maybe lower,
+                # but only after a few consecutive comfortable checks
+                tuner["comfortable"] += 1
+                if tuner["comfortable"] >= tuner["lower_patience"]:
+                    tuner["comfortable"] = 0
+                    spare = free_worst - headroom_gb
+                    new_pct = self.sd.try_decrease_layer_offload(step_for(spare))
+                    if new_pct is not None:
+                        print_acc(
+                            f"[adaptive-offload] {free_worst:.1f}GB free (worst) "
+                            f"-> offload {new_pct * 100:.0f}% (faster)"
+                        )
             else:
-                tuner["converged"] = True
-                print_acc(
-                    f"[adaptive-offload] converged at {cur * 100:.0f}% "
-                    f"({headroom:.1f}GB free)"
-                )
-            torch.cuda.reset_peak_memory_stats(device)
+                # within the target band -> hold, keep watching
+                tuner["comfortable"] = 0
         except Exception as e:  # noqa: BLE001 - tuning must never break training
             print_acc(f"[adaptive-offload] tick failed: {e}")
 
