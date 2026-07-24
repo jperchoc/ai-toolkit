@@ -1,0 +1,89 @@
+---
+# Krea 2 LoRA on a 12 GB card (e.g. RTX 4070 Ti). Tuned for low VRAM:
+# quantized transformer, cached latents + text embeddings, and AUTO layer
+# offloading so you don't have to hand-tune the offload percent to avoid OOM.
+job: extension
+config:
+  name: "my_krea2_lora_v1"
+  process:
+    - type: 'sd_trainer'
+      training_folder: "output"
+      device: cuda:0
+#      trigger_word: "p3r5on"
+      network:
+        type: "lora"
+        linear: 16
+        linear_alpha: 16
+      save:
+        dtype: float16
+        save_every: 250
+        max_step_saves_to_keep: 4
+      datasets:
+        - folder_path: "/path/to/images/folder"
+          caption_ext: "txt"
+          caption_dropout_rate: 0.05
+          shuffle_tokens: false
+          cache_latents_to_disk: true   # frees the VAE from VRAM after caching
+          # 12 GB: 768 is a good default; add 1024 only if you have headroom.
+          resolution: [ 512, 768 ]
+      train:
+        batch_size: 1
+        # caching text embeddings lets the text encoder be dropped from VRAM.
+        cache_text_embeddings: true
+        steps: 2000
+        gradient_accumulation: 1
+        train_unet: true
+        train_text_encoder: false
+        gradient_checkpointing: true   # required on 12 GB
+        noise_scheduler: "flowmatch"
+        optimizer: "adamw8bit"
+        lr: 1e-4
+        dtype: bf16
+      model:
+        # Krea 2 raw. Either a hub repo id, or a LOCAL path to your custom
+        # checkpoint (.safetensors file or a folder containing one). A local
+        # path also means no network is needed for the weights.
+        name_or_path: "/path/to/krea2-raw.safetensors"
+        arch: "krea2"
+        quantize: true                 # float8 transformer (auto when offloading)
+        quantize_te: true
+        # --- VRAM: automatic layer offloading -------------------------------
+        # Streams transformer layers from CPU. "auto" computes the percent from
+        # your free VRAM and the model size at load time — no more trial & error.
+        # Raise layer_offloading_reserved_gb if you still OOM; lower it to go
+        # faster. You can also set an explicit 0.0-1.0 instead of "auto".
+        layer_offloading: true
+        layer_offloading_transformer_percent: auto
+        layer_offloading_text_encoder_percent: auto
+        layer_offloading_reserved_gb: 4.0
+        model_kwargs:
+          # Offline training: load the text encoder / VAE / checkpoints from the
+          # local HF cache only (no network). Uncomment if you train offline.
+#          offline: true
+          # Point these at local folders to avoid any hub lookup at all:
+#          text_encoder_path: "/path/to/Qwen3-VL-4B-Instruct"
+#          vae_path: "/path/to/Qwen-Image"
+      sample:
+        sampler: "flowmatch"
+        sample_every: 250
+        width: 1024
+        height: 1024
+        prompts:
+          - "[trigger] portrait, natural light"
+          - "[trigger] full body, city street, golden hour"
+        neg: ""
+        seed: 42
+        walk_seed: true
+        guidance_scale: 4
+        sample_steps: 20
+        # Krea 2 is used in production with a turbo + a style lora. Stack them on
+        # the samples so previews match the final result (see the sample-loras
+        # feature). Only affects sampling, never the trained lora.
+#        loras:
+#          - path: "/path/to/krea2-turbo.safetensors"
+#            weight: 1.0
+#          - path: "/path/to/style.safetensors"
+#            weight: 0.8
+meta:
+  name: "[name]"
+  version: '1.0'

@@ -22,7 +22,15 @@ os.environ['DISABLE_TELEMETRY'] = 'YES'
 
 # set torch to trace mode
 import torch
-    
+
+# Enable TF32 matmuls on Ampere+ (e.g. RTX 40-series): a free speedup on fp32
+# ops with negligible quality impact. Opt out with AITK_TF32=0.
+if os.environ.get("AITK_TF32", "1") != "0" and torch.cuda.is_available():
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+    torch.set_float32_matmul_precision("high")
+    print("TF32 matmul enabled (set AITK_TF32=0 to disable)")
+
 # check if we have DEBUG_TOOLKIT in env
 if os.environ.get("DEBUG_TOOLKIT", "0") == "1":
     torch.autograd.set_detect_anomaly(True)

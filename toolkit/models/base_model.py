@@ -283,6 +283,15 @@ class BaseModel:
         raise NotImplementedError(
             "load_model must be implemented in child classes")
 
+    def try_increase_layer_offload(self, step: float = 0.1):
+        """Raise the transformer layer-offload level to recover from an OOM.
+
+        Default: not supported -> returns None and the trainer keeps its normal
+        OOM handling. Models that support auto offloading (e.g. krea2) override
+        this to detach/re-attach the memory manager at a higher percent.
+        """
+        return None
+
     def get_generation_pipeline(self):
         # override this in child classes
         raise NotImplementedError(

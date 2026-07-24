@@ -767,9 +767,29 @@ class ModelConfig:
         if torch.backends.mps.is_available() and self.qtype_te == "qfloat8":
             self.qtype_te = "int8"
         
-        # 0 is off and 1.0 is 100% of the layers
-        self.layer_offloading_transformer_percent = kwargs.get("layer_offloading_transformer_percent", 1.0)
-        self.layer_offloading_text_encoder_percent = kwargs.get("layer_offloading_text_encoder_percent", 1.0)
+        # 0 is off and 1.0 is 100% of the layers. The value may also be the
+        # string "auto": the percent is then computed from free VRAM and the
+        # module's weight footprint at load time (supported models only). We keep
+        # the numeric attribute a float (default 1.0) so every model that just
+        # compares `> 0` keeps working, and expose the intent via a separate flag.
+        def _offload_percent(key):
+            raw = kwargs.get(key, 1.0)
+            is_auto = isinstance(raw, str) and raw.strip().lower() == "auto"
+            return (1.0 if is_auto else float(raw)), is_auto
+
+        (
+            self.layer_offloading_transformer_percent,
+            self.layer_offloading_transformer_auto,
+        ) = _offload_percent("layer_offloading_transformer_percent")
+        (
+            self.layer_offloading_text_encoder_percent,
+            self.layer_offloading_text_encoder_auto,
+        ) = _offload_percent("layer_offloading_text_encoder_percent")
+        # VRAM (GB) to hold back for activations, optimizer state, VAE/TE and the
+        # CUDA context when auto-sizing the offload. Raise it if you still OOM.
+        self.layer_offloading_reserved_gb = float(
+            kwargs.get("layer_offloading_reserved_gb", 4.0)
+        )
 
         # can be used to load the extras like text encoder or vae from here
         # only setup for some models but will prevent having to download the te for

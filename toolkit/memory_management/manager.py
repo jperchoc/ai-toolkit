@@ -165,6 +165,24 @@ class MemoryManager:
                     continue
 
     @classmethod
+    def reattach(
+        cls,
+        module: torch.nn.Module,
+        device: torch.device,
+        offload_percent: float = 1.0,
+        ignore_modules: list[torch.nn.Module] = [],
+    ):
+        """Detach then re-attach at a new offload_percent. Used to raise the
+        offload level on the fly (e.g. after an OOM) without reloading the model."""
+        cls.detach(module)
+        cls.attach(
+            module,
+            device,
+            offload_percent=offload_percent,
+            ignore_modules=ignore_modules,
+        )
+
+    @classmethod
     def detach(cls, module: torch.nn.Module):
         """
         Reverse of attach(). Moves unmanaged modules back to CPU, restores the

@@ -2631,10 +2631,20 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 optimizer.zero_grad(set_to_none=True)
                 flush()
                 torch.cuda.ipc_collect()
+                # try to actually recover: raise the transformer offload level so
+                # the next step has more headroom (supported models only; no-op
+                # otherwise). Best-effort — falls back to just skipping the batch.
+                new_pct = None
+                try:
+                    new_pct = self.sd.try_increase_layer_offload()
+                except Exception as e:  # noqa: BLE001
+                    print_acc(f"# auto-offload recovery failed: {e}")
                 # skip this step and keep going
                 print_acc("")
                 print_acc("################################################")
                 print_acc(f"# OOM during training step, skipping batch {self.num_consecutive_oom}/3 #")
+                if new_pct is not None:
+                    print_acc(f"# auto-offload: raised transformer offload to {new_pct*100:.0f}% #")
                 print_acc("################################################")
                 print_acc("")
             else:
