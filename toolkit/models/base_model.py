@@ -292,6 +292,15 @@ class BaseModel:
         """
         return None
 
+    def try_decrease_layer_offload(self, step: float = 0.05):
+        """Lower the offload level (more resident on GPU) to go faster when
+        VRAM headroom allows. Default: unsupported -> None."""
+        return None
+
+    def get_layer_offload_percent(self):
+        """Current transformer offload percent, or None if not offloading."""
+        return None
+
     # --- sample loras (stack extra loras on generated samples) --------------
     # Default: unsupported -> no-op. Models with their own lora system (e.g.
     # krea2) override these to load/activate the loras carried on each

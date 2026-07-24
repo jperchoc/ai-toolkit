@@ -61,10 +61,13 @@ config:
         # Leave commented to use the default (float8 when offloading).
 #        qtype: "convrot8"
         # --- VRAM: automatic layer offloading -------------------------------
-        # Streams transformer layers from CPU. "auto" computes the percent from
-        # your free VRAM and the model size at load time — no more trial & error.
-        # Raise layer_offloading_reserved_gb if you still OOM; lower it to go
-        # faster. You can also set an explicit 0.0-1.0 instead of "auto".
+        # Streams transformer layers from CPU. "auto" starts from a percent
+        # computed from your VRAM + model size, then ADAPTIVELY lowers it during
+        # training while there's spare VRAM (faster) and raises it on OOM — it
+        # converges to using your card to the fullest, no trial & error.
+        # Pin an explicit 0.0-1.0 instead of "auto" to disable the auto-tuning.
+        # AITK_ADAPTIVE_OFFLOAD=0 disables the loop; AITK_OFFLOAD_HEADROOM_GB
+        # sets the VRAM margin to keep free (default 0.7).
         layer_offloading: true
         layer_offloading_transformer_percent: auto
         layer_offloading_text_encoder_percent: auto

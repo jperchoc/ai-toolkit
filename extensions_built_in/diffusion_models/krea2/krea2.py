@@ -592,18 +592,19 @@ class Krea2Model(BaseModel):
         self.pipeline = Krea2Pipeline(self)
         self.print_and_status_update("Model Loaded")
 
-    def try_increase_layer_offload(self, step: float = 0.1) -> Optional[float]:
-        """Raise the transformer offload level and re-attach, to recover from an
-        OOM during training. Best-effort: returns the new percent, or None if
-        offloading isn't active, is already maxed, or the re-attach failed (in
-        which case the caller keeps its existing behaviour)."""
+    def get_layer_offload_percent(self) -> Optional[float]:
+        """Current transformer offload percent, or None if offloading is off."""
+        if not self._offload_ctx:
+            return None
+        return self.model_config.layer_offloading_transformer_percent
+
+    def _set_layer_offload_percent(self, new_percent: float) -> Optional[float]:
+        """Re-attach the memory manager at a new offload percent (best-effort).
+        Returns the applied percent, or None if not possible / failed."""
         ctx = self._offload_ctx
         if not ctx:
             return None
-        current = self.model_config.layer_offloading_transformer_percent
-        if current >= 1.0:
-            return None
-        new_percent = min(1.0, round(current + step, 4))
+        new_percent = min(1.0, max(0.0, round(new_percent, 4)))
         try:
             MemoryManager.reattach(
                 ctx["module"],
@@ -616,9 +617,24 @@ class Krea2Model(BaseModel):
             self.model_config.layer_offloading_transformer_percent = new_percent
             flush()
             return new_percent
-        except Exception as e:  # noqa: BLE001 - recovery must never crash training
-            print(f"[auto-offload] failed to raise transformer offload: {e}")
+        except Exception as e:  # noqa: BLE001 - must never crash training
+            print(f"[auto-offload] failed to set transformer offload: {e}")
             return None
+
+    def try_increase_layer_offload(self, step: float = 0.1) -> Optional[float]:
+        """Raise the offload level (more streamed from CPU) to recover from OOM."""
+        current = self.get_layer_offload_percent()
+        if current is None or current >= 1.0:
+            return None
+        return self._set_layer_offload_percent(current + step)
+
+    def try_decrease_layer_offload(self, step: float = 0.05) -> Optional[float]:
+        """Lower the offload level (more resident on GPU) to go faster when there
+        is spare VRAM."""
+        current = self.get_layer_offload_percent()
+        if current is None or current <= 0.0:
+            return None
+        return self._set_layer_offload_percent(current - step)
 
     # ------------------------------------------------------------------
     # Sample loras (stack extra loras on generated samples)

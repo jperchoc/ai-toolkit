@@ -422,6 +422,80 @@ class BaseSDTrainProcess(BaseTrainProcess):
         except Exception as e:  # noqa: BLE001 - reporting must never break training
             print_acc(f"[vram] report failed: {e}")
 
+    def _adaptive_offload_tick(self, did_oom):
+        """In auto offload mode, converge to the fastest offload that fits: lower
+        it while VRAM headroom is comfortable, and lock in when OOM recovery has
+        to back off. Only runs when layer_offloading_transformer_percent: auto.
+        Disable with AITK_ADAPTIVE_OFFLOAD=0; tune the target headroom (GB) with
+        AITK_OFFLOAD_HEADROOM_GB."""
+        try:
+            if not (
+                self.model_config.layer_offloading
+                and self.model_config.layer_offloading_transformer_auto
+            ):
+                return
+            if os.environ.get("AITK_ADAPTIVE_OFFLOAD", "1") == "0":
+                return
+            cur = self.sd.get_layer_offload_percent()
+            if cur is None:
+                return
+
+            tuner = getattr(self, "_offload_tuner", None)
+            if tuner is None:
+                try:
+                    headroom_gb = float(os.environ.get("AITK_OFFLOAD_HEADROOM_GB", "0.7"))
+                except ValueError:
+                    headroom_gb = 0.7
+                tuner = {
+                    "converged": False, "seen": 0, "steps_since": 0,
+                    "warmup": 15, "interval": 25, "step": 0.05,
+                    "headroom_gb": headroom_gb,
+                }
+                self._offload_tuner = tuner
+
+            tuner["seen"] += 1
+            if tuner["converged"]:
+                return
+
+            if did_oom:
+                # OOM recovery already raised the offload; settle just above the
+                # failure point and stop adjusting.
+                tuner["converged"] = True
+                now = self.sd.get_layer_offload_percent()
+                print_acc(
+                    f"[adaptive-offload] converged at {now * 100:.0f}% "
+                    "(backed off after OOM)"
+                )
+                return
+
+            if tuner["seen"] < tuner["warmup"]:
+                return
+            tuner["steps_since"] += 1
+            if tuner["steps_since"] < tuner["interval"]:
+                return
+            tuner["steps_since"] = 0
+
+            from toolkit.memory_management import gpu_mem_gb
+
+            device = self.device_torch
+            total, _ = gpu_mem_gb(device)
+            if total is None:
+                return
+            peak = torch.cuda.max_memory_allocated(device) / (1024 ** 3)
+            headroom = total - peak
+            if cur > 0.0 and headroom > tuner["headroom_gb"]:
+                new_pct = self.sd.try_decrease_layer_offload(tuner["step"])
+                if new_pct is not None:
+                    print_acc(
+                        f"[adaptive-offload] {headroom:.1f}GB free -> offload "
+                        f"{new_pct * 100:.0f}% (faster)"
+                    )
+                    if new_pct <= 0.0:
+                        tuner["converged"] = True  # fully resident, done
+            torch.cuda.reset_peak_memory_stats(device)
+        except Exception as e:  # noqa: BLE001 - tuning must never break training
+            print_acc(f"[adaptive-offload] tick failed: {e}")
+
     def update_training_metadata(self):
         o_dict = OrderedDict({
             "training_info": self.get_training_info()
@@ -2692,6 +2766,9 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 print_acc("")
             else:
                 self.num_consecutive_oom = 0
+            # adaptive offload: in auto mode, lower the offload while VRAM allows
+            # (faster) and let OOM recovery above settle it -> uses the card fully
+            self._adaptive_offload_tick(did_oom)
             if self.torch_profiler is not None:
                 torch.cuda.synchronize()  # Make sure all CUDA ops are done
                 self.torch_profiler.stop()
