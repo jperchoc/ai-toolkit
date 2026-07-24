@@ -267,9 +267,12 @@ class Krea2Model(BaseModel):
         # level on the fly (see try_increase_layer_offload).
         self._offload_ctx = None
 
-        # Extra loras stacked on samples (path -> LoRASpecialNetwork), built lazily
-        # and reused across sample steps. See prepare_sample_loras.
+        # Extra loras stacked on samples (path -> LoRASpecialNetwork). Built at
+        # LOAD time (same point the training network attaches) and reused across
+        # sample steps; sampling only toggles their weight. See load_model /
+        # prepare_sample_loras.
         self._sample_lora_networks = {}
+        self._pending_sample_lora_paths = []
 
     @staticmethod
     def get_train_scheduler():
@@ -589,8 +592,24 @@ class Krea2Model(BaseModel):
                 except Exception as e:  # noqa: BLE001
                     self.print_and_status_update(f"torch.compile failed, continuing: {e}")
 
+        # Build extra sample loras now — at load time, the same point the
+        # training network attaches successfully (attaching mid-sampling was
+        # failing with 0 modules). They stay inactive until sampling.
+        self._build_pending_sample_loras()
+
         self.pipeline = Krea2Pipeline(self)
         self.print_and_status_update("Model Loaded")
+
+    def _build_pending_sample_loras(self) -> None:
+        paths = getattr(self, "_pending_sample_lora_paths", None) or []
+        for p in paths:
+            if p in self._sample_lora_networks:
+                continue
+            try:
+                self._sample_lora_networks[p] = self._load_sample_lora_network(p)
+                self.print_and_status_update(f"[sample-lora] loaded {p}")
+            except Exception as e:  # noqa: BLE001 - never block model load
+                print(f"[sample-lora] SKIPPED {p}: {e}")
 
     def get_layer_offload_percent(self) -> Optional[float]:
         """Current transformer offload percent, or None if offloading is off."""

@@ -1910,6 +1910,19 @@ class BaseSDTrainProcess(BaseTrainProcess):
         )
         
         self.hook_after_sd_init_before_load()
+        # Collect extra sample-lora paths so the model can build them AT LOAD TIME
+        # (same moment the training network attaches successfully), rather than
+        # mid-sampling where the attach was failing.
+        try:
+            sample_lora_paths = []
+            for cfg in (self.sample_config, getattr(self, "first_sample_config", None)):
+                for s in getattr(cfg, "samples", []) or []:
+                    for lora in getattr(s, "loras", []) or []:
+                        if lora.path not in sample_lora_paths:
+                            sample_lora_paths.append(lora.path)
+            self.sd._pending_sample_lora_paths = sample_lora_paths
+        except Exception as e:  # noqa: BLE001
+            print_acc(f"[sample-lora] could not collect paths: {e}")
         # run base sd process run
         self.sd.load_model()
         
