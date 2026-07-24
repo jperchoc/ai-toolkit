@@ -683,9 +683,14 @@ class Krea2Model(BaseModel):
             type="lora", linear=dim, linear_alpha=dim, transformer_only=True
         )
         LoRASpecialNetwork.LORA_PREFIX_UNET = "lora_transformer"
+        # Mirror how the trainer builds the training network: pass base_model=self
+        # and unet=get_model_to_train(). base_model drives get_transformer_block_names
+        # so the lora attaches to the (quantized) blocks — without it apply_to
+        # matches zero modules on a quantized transformer.
+        transformer = self.get_model_to_train()
         network = LoRASpecialNetwork(
             text_encoder=None,
-            unet=self.model,
+            unet=transformer,
             lora_dim=network_config.linear,
             multiplier=0.0,
             alpha=network_config.linear_alpha,
@@ -694,11 +699,12 @@ class Krea2Model(BaseModel):
             network_config=network_config,
             network_type=network_config.type,
             transformer_only=network_config.transformer_only,
-            is_transformer=True,
+            is_transformer=self.is_transformer,
+            base_model=self,
             target_lin_modules=self.target_lora_modules,
             is_assistant_adapter=True,
         )
-        network.apply_to(None, self.model, apply_text_encoder=False, apply_unet=True)
+        network.apply_to(None, transformer, apply_text_encoder=False, apply_unet=True)
         network.force_to(self.device_torch, dtype=self.torch_dtype)
         network._update_torch_multiplier()
         extra = network.load_weights(state_dict)
