@@ -23,10 +23,37 @@ def _module_weight_bytes(module: torch.nn.Module) -> int:
     return total
 
 
+def gpu_mem_gb(device: torch.device):
+    """(total, free) VRAM in GB for a cuda device, or (None, None) otherwise."""
+    if not torch.cuda.is_available() or device is None or torch.device(device).type != "cuda":
+        return None, None
+    gb = 1024 ** 3
+    props = torch.cuda.get_device_properties(device)
+    try:
+        free, _ = torch.cuda.mem_get_info(device)
+    except Exception:
+        free = props.total_memory
+    return props.total_memory / gb, free / gb
+
+
+def log_vram(device: torch.device, label: str = "vram") -> None:
+    """Print current/peak VRAM for a device (no-op on CPU)."""
+    if not torch.cuda.is_available() or device is None or torch.device(device).type != "cuda":
+        return
+    gb = 1024 ** 3
+    total, free = gpu_mem_gb(device)
+    alloc = torch.cuda.memory_allocated(device) / gb
+    peak = torch.cuda.max_memory_allocated(device) / gb
+    print(
+        f"[{label}] vram total={total:.1f}GB free={free:.1f}GB "
+        f"allocated={alloc:.1f}GB peak={peak:.1f}GB"
+    )
+
+
 def compute_offload_percent(
     module: torch.nn.Module,
     device: torch.device,
-    reserved_gb: float = 4.0,
+    reserved_gb=4.0,
     safety: float = 0.9,
     granularity: float = 0.05,
     label: str = "transformer",
@@ -36,6 +63,9 @@ def compute_offload_percent(
 
     budget = total_vram * safety - reserved_gb   (reserved covers activations,
     the trained adapter's grads/optimizer state, VAE/TE, and CUDA context).
+    `reserved_gb` may be None -> derived heuristically as ~30% of total VRAM
+    (min 3 GB), a reasonable allowance for activations + optimizer on top of the
+    resident weights.
     """
     if not torch.cuda.is_available() or device is None or torch.device(device).type != "cuda":
         # nothing to offload against; keep the safe default (full offload)
@@ -47,6 +77,9 @@ def compute_offload_percent(
         free, _ = torch.cuda.mem_get_info(device)
     except Exception:
         free = total
+
+    if reserved_gb is None:
+        reserved_gb = max(3.0, (total / (1024 ** 3)) * 0.30)
 
     weight_bytes = _module_weight_bytes(module)
     budget = total * safety - reserved_gb * (1024 ** 3)

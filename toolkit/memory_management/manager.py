@@ -1,3 +1,4 @@
+import os
 import torch
 from .manager_modules import (
     LinearLayerMemoryManager,
@@ -95,6 +96,37 @@ class MemoryManager:
 
         # count ignore modules as processed
         modules_processed = [x for x in ignore_modules]
+
+        # Deterministic partial offload: when offload_percent < 1.0 we offload
+        # (memory-manage) the LARGEST layers first, up to that fraction of the
+        # managed layers, instead of a random subset. Largest-first frees the
+        # most VRAM per offloaded layer, and being deterministic means a percent
+        # that fits will keep fitting on re-runs (random selection could OOM by
+        # unlucky draw). Set MEMORY_MANAGER_RANDOM_OFFLOAD=1 for the old behavior.
+        offload_ids = None
+        use_random = os.environ.get("MEMORY_MANAGER_RANDOM_OFFLOAD", "0") == "1"
+        if offload_percent < 1.0 and not use_random:
+            ignore_ids = {id(x) for x in ignore_modules}
+            candidates = []
+            seen_ids = set()
+            for _name, sub in module.named_modules():
+                cname = sub.__class__.__name__
+                if cname not in LINEAR_MODULES and cname not in CONV_MODULES:
+                    continue
+                if id(sub) in ignore_ids or id(sub) in seen_ids:
+                    continue
+                seen_ids.add(id(sub))
+                nbytes = sum(
+                    t.numel() * t.element_size()
+                    for t in list(sub.parameters(recurse=False))
+                    + list(sub.buffers(recurse=False))
+                    if t is not None
+                )
+                candidates.append((nbytes, _name, id(sub)))
+            # largest first (name as a stable tie-breaker)
+            candidates.sort(key=lambda c: (-c[0], c[1]))
+            k = round(offload_percent * len(candidates))
+            offload_ids = {cid for _b, _n, cid in candidates[:k]}
         # attach to all modules
         for name, sub_module in module.named_modules():
             for child_name, child_module in sub_module.named_modules():
@@ -104,8 +136,11 @@ class MemoryManager:
                 ):
                     skip = False
                     if offload_percent < 1.0:
-                        # randomly skip some modules
-                        if random.random() > offload_percent:
+                        if offload_ids is not None:
+                            # deterministic: keep resident unless in the offload set
+                            skip = id(child_module) not in offload_ids
+                        elif random.random() > offload_percent:
+                            # legacy random selection
                             skip = True
                     if skip:
                         module._memory_manager.unmanaged_modules.append(child_module)
@@ -135,8 +170,9 @@ class MemoryManager:
                 ):
                     skip = False
                     if offload_percent < 1.0:
-                        # randomly skip some modules
-                        if random.random() > offload_percent:
+                        if offload_ids is not None:
+                            skip = id(child_module) not in offload_ids
+                        elif random.random() > offload_percent:
                             skip = True
                     if skip:
                         module._memory_manager.unmanaged_modules.append(child_module)

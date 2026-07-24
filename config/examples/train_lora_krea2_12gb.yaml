@@ -36,6 +36,8 @@ config:
         train_text_encoder: false
         gradient_checkpointing: true   # required on 12 GB
         noise_scheduler: "flowmatch"
+        # adamw8bit is a good low-VRAM default. If you get occasional OOM spikes,
+        # "paged_adamw8bit" pages optimizer state to host memory to ride them out.
         optimizer: "adamw8bit"
         lr: 1e-4
         dtype: bf16
@@ -45,8 +47,19 @@ config:
         # path also means no network is needed for the weights.
         name_or_path: "/path/to/krea2-raw.safetensors"
         arch: "krea2"
-        quantize: true                 # float8 transformer (auto when offloading)
+        quantize: true
         quantize_te: true
+        # Quantization type for the transformer. Good options on a 4070 Ti (Ada):
+        #   float8    - weight-only fp8. Saves VRAM, no gemm speedup. Safe default.
+        #   convrot8  - W8A8 int8 + Hadamard rotation. Near-lossless (~1% weight
+        #               error) AND uses Ada's int8 tensor cores -> real matmul
+        #               speedup. Recommended if you want faster steps at similar
+        #               quality. Works with layer offloading.
+        #   uint4     - 4-bit weight-only. Lowest VRAM, higher quality risk.
+        #   convrot4  - W4A4 (NVFP4). Only *accelerates* on Blackwell (sm_100+);
+        #               on Ada it just saves VRAM with 4-bit quality risk.
+        # Leave commented to use the default (float8 when offloading).
+#        qtype: "convrot8"
         # --- VRAM: automatic layer offloading -------------------------------
         # Streams transformer layers from CPU. "auto" computes the percent from
         # your free VRAM and the model size at load time — no more trial & error.
@@ -55,6 +68,8 @@ config:
         layer_offloading: true
         layer_offloading_transformer_percent: auto
         layer_offloading_text_encoder_percent: auto
+        # GB held back for activations/optimizer/VAE/TE. A number, or "auto" to
+        # derive it from total VRAM (~30%). Raise it if you still OOM.
         layer_offloading_reserved_gb: 4.0
         model_kwargs:
           # Offline training: load the text encoder / VAE / checkpoints from the
@@ -63,6 +78,10 @@ config:
           # Point these at local folders to avoid any hub lookup at all:
 #          text_encoder_path: "/path/to/Qwen3-VL-4B-Instruct"
 #          vae_path: "/path/to/Qwen-Image"
+          # Optional torch.compile of the transformer. Faster once shapes settle,
+          # but disable layer_offloading and use a single resolution for it to
+          # help (bucketed multi-res triggers recompiles).
+#          compile_transformer: true
       sample:
         sampler: "flowmatch"
         sample_every: 250

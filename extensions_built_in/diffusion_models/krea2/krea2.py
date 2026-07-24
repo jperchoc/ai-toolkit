@@ -109,6 +109,26 @@ def _hf_offline_from_env() -> bool:
     return False
 
 
+def _ensure_cached_offline(repo_id: str, filename: str, what: str) -> None:
+    """Offline pre-flight: fail fast with an actionable message if a hub repo
+    isn't in the local cache, instead of a deep from_pretrained traceback.
+    Skipped for local directory paths (which are always available)."""
+    if os.path.isdir(repo_id) or os.path.isfile(repo_id):
+        return
+    try:
+        cached = huggingface_hub.try_to_load_from_cache(repo_id, filename)
+    except Exception:
+        cached = None
+    # a str path means it's present; None or the _CACHED_NO_EXIST sentinel mean not
+    if not isinstance(cached, str):
+        raise FileNotFoundError(
+            f"Offline mode: {what} '{repo_id}' is not in the local HF cache "
+            f"(looked for '{filename}'). Download it once online, or set "
+            f"model.model_kwargs.{'text_encoder_path' if what == 'text encoder' else 'vae_path'} "
+            f"to a local folder."
+        )
+
+
 def patch_qwen_vl_patch_embed(model):
     """Qwen-VL's vision patch_embed is a Conv3d whose kernel == stride, i.e. a plain
     linear projection of each flattened patch. bf16 Conv3d has no fast cuDNN kernel and
@@ -291,6 +311,8 @@ class Krea2Model(BaseModel):
         te_path = self.model_config.model_kwargs.get("text_encoder_path", QWEN3_VL_PATH)
         # A local directory is inherently offline; a repo id needs the flag/env.
         local_only = self.offline or os.path.isdir(te_path)
+        if local_only:
+            _ensure_cached_offline(te_path, "config.json", "text encoder")
         self.print_and_status_update(
             f"Loading Qwen3-VL text encoder from {te_path}"
             + (" (local only)" if local_only else "")
@@ -330,6 +352,8 @@ class Krea2Model(BaseModel):
     def _load_vae(self):
         vae_path = self.model_config.model_kwargs.get("vae_path", QWEN_IMAGE_VAE_PATH)
         local_only = self.offline or os.path.isdir(vae_path)
+        if local_only:
+            _ensure_cached_offline(vae_path, "vae/config.json", "VAE")
         self.print_and_status_update(f"Loading Qwen-Image VAE from {vae_path}")
         vae = AutoencoderKLQwenImage.from_pretrained(
             vae_path, subfolder="vae", torch_dtype=self.vae_torch_dtype, token=HF_TOKEN,
@@ -544,6 +568,23 @@ class Krea2Model(BaseModel):
         self.processor = processor
         self.vl_processor = vl_processor
         self.model = transformer
+
+        # Optional torch.compile of the transformer (model_kwargs.compile_transformer:
+        # true). Off by default. Incompatible with layer offloading (per-layer CPU
+        # streaming breaks the graph) and works best at a single resolution, since
+        # multi-resolution buckets trigger recompiles.
+        if self.model_config.model_kwargs.get("compile_transformer", False):
+            if self.model_config.layer_offloading:
+                self.print_and_status_update(
+                    "compile_transformer ignored: incompatible with layer_offloading"
+                )
+            else:
+                try:
+                    self.model = torch.compile(self.model, mode="reduce-overhead")
+                    self.print_and_status_update("Transformer compiled (reduce-overhead)")
+                except Exception as e:  # noqa: BLE001
+                    self.print_and_status_update(f"torch.compile failed, continuing: {e}")
+
         self.pipeline = Krea2Pipeline(self)
         self.print_and_status_update("Model Loaded")
 

@@ -787,9 +787,14 @@ class ModelConfig:
         ) = _offload_percent("layer_offloading_text_encoder_percent")
         # VRAM (GB) to hold back for activations, optimizer state, VAE/TE and the
         # CUDA context when auto-sizing the offload. Raise it if you still OOM.
-        self.layer_offloading_reserved_gb = float(
-            kwargs.get("layer_offloading_reserved_gb", 4.0)
-        )
+        # "auto" (or null) derives it heuristically from total VRAM.
+        _reserved = kwargs.get("layer_offloading_reserved_gb", 4.0)
+        if _reserved is None or (
+            isinstance(_reserved, str) and _reserved.strip().lower() == "auto"
+        ):
+            self.layer_offloading_reserved_gb = None
+        else:
+            self.layer_offloading_reserved_gb = float(_reserved)
 
         # can be used to load the extras like text encoder or vae from here
         # only setup for some models but will prevent having to download the te for

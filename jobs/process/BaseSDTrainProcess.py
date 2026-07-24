@@ -368,16 +368,59 @@ class BaseSDTrainProcess(BaseTrainProcess):
         if self.adapter is not None and isinstance(self.adapter, CustomAdapter):
             self.adapter.is_sampling = True
         
-        # send to be generated
-        self.sd.generate_images(gen_img_config_list, sampler=sample_config.sampler)
+        # send to be generated. An OOM here (sampling needs its own activations,
+        # sometimes extra sample loras) should NOT kill the whole run — skip the
+        # sample, free memory, and keep training.
+        try:
+            self.sd.generate_images(gen_img_config_list, sampler=sample_config.sampler)
+        except torch.cuda.OutOfMemoryError:
+            flush()
+            print_acc(
+                "# OOM during sampling — skipped these samples. Lower sample "
+                "width/height or sample fewer prompts to preview on this GPU."
+            )
 
-        
         if self.adapter is not None and isinstance(self.adapter, CustomAdapter):
             self.adapter.is_sampling = False
 
         if self.ema is not None:
             self.ema.train()
+
+        # VRAM report + profile: log current/peak VRAM and persist a small profile
+        # (resolved offload percent + peak) so you can tune reserved_gb / offload
+        # and re-use a known-good value next run. Peak is reset for the next window.
+        self._report_and_persist_vram(step)
+
         print_acc("") # add a line break
+
+    def _report_and_persist_vram(self, step=None):
+        try:
+            from toolkit.memory_management import gpu_mem_gb, log_vram
+
+            device = self.device_torch
+            log_vram(device, "vram")
+            total, free = gpu_mem_gb(device)
+            if total is None:
+                return
+            gb = 1024 ** 3
+            peak = torch.cuda.max_memory_allocated(device) / gb
+            profile = {
+                "step": step,
+                "vram_total_gb": round(total, 2),
+                "vram_peak_gb": round(peak, 2),
+                "layer_offloading": bool(self.model_config.layer_offloading),
+                "layer_offloading_transformer_percent": (
+                    self.model_config.layer_offloading_transformer_percent
+                ),
+                "layer_offloading_text_encoder_percent": (
+                    self.model_config.layer_offloading_text_encoder_percent
+                ),
+            }
+            with open(os.path.join(self.save_root, "vram_profile.json"), "w") as f:
+                json.dump(profile, f, indent=2)
+            torch.cuda.reset_peak_memory_stats(device)
+        except Exception as e:  # noqa: BLE001 - reporting must never break training
+            print_acc(f"[vram] report failed: {e}")
 
     def update_training_metadata(self):
         o_dict = OrderedDict({

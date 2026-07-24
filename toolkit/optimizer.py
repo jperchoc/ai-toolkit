@@ -65,6 +65,9 @@ def get_optimizer(
 
         if lower_type == "adam8bit":
             return bitsandbytes.optim.Adam8bit(params, lr=learning_rate, eps=1e-6, **optimizer_params)
+        if lower_type == "paged_adamw8bit":
+            # paged optimizer state survives VRAM spikes by paging to host memory
+            return bitsandbytes.optim.PagedAdamW8bit(params, lr=learning_rate, eps=1e-6, **optimizer_params)
         if lower_type == "ademamix8bit":
             return bitsandbytes.optim.AdEMAMix8bit(params, lr=learning_rate, eps=1e-6, **optimizer_params)
         elif lower_type == "adamw8bit":

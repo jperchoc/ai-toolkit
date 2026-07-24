@@ -340,6 +340,35 @@ export default function SimpleJob({
                 onChange={value => setJobConfig(value, 'config.process[0].model.model_kwargs.kv_cache')}
               />
             )}
+            {modelArch?.additionalSections?.includes('model.model_kwargs.offline') && (
+              <Checkbox
+                label="Offline (local HF cache only)"
+                checked={jobConfig.config.process[0].model.model_kwargs.offline || false}
+                onChange={value => setJobConfig(value, 'config.process[0].model.model_kwargs.offline')}
+              />
+            )}
+            {modelArch?.additionalSections?.includes('model.model_kwargs.text_encoder_path') && (
+              <TextInput
+                label="Text Encoder Path (optional, local folder or HF id)"
+                value={jobConfig.config.process[0].model.model_kwargs.text_encoder_path || ''}
+                onChange={(value: string | null) => {
+                  if (value?.trim() === '') value = null;
+                  setJobConfig(value, 'config.process[0].model.model_kwargs.text_encoder_path');
+                }}
+                placeholder=""
+              />
+            )}
+            {modelArch?.additionalSections?.includes('model.model_kwargs.vae_path') && (
+              <TextInput
+                label="VAE Path (optional, local folder or HF id)"
+                value={jobConfig.config.process[0].model.model_kwargs.vae_path || ''}
+                onChange={(value: string | null) => {
+                  if (value?.trim() === '') value = null;
+                  setJobConfig(value, 'config.process[0].model.model_kwargs.vae_path');
+                }}
+                placeholder=""
+              />
+            )}
             {modelArch?.additionalSections?.includes('model.qie.match_target_res') && (
               <Checkbox
                 label="Match Target Res"
