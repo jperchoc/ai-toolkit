@@ -795,6 +795,17 @@ class ModelConfig:
             self.layer_offloading_reserved_gb = None
         else:
             self.layer_offloading_reserved_gb = float(_reserved)
+        # How often (in steps) to re-tune the transformer offload during training.
+        # 0/null = OFF (default): the offload is fixed for the whole run, which is
+        # rock-solid. layer_offloading_transformer_percent is then just the
+        # starting value (a number, or "auto" to size it once at load). Set a
+        # positive N to enable adaptive re-tuning every N steps (experimental: it
+        # re-attaches the memory manager on the fly).
+        _adjust = kwargs.get("layer_offloading_adjust_every", 0)
+        try:
+            self.layer_offloading_adjust_every = int(_adjust or 0)
+        except (TypeError, ValueError):
+            self.layer_offloading_adjust_every = 0
 
         # can be used to load the extras like text encoder or vae from here
         # only setup for some models but will prevent having to download the te for

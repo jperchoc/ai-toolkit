@@ -60,23 +60,23 @@ config:
         #               on Ada it just saves VRAM with 4-bit quality risk.
         # Leave commented to use the default (float8 when offloading).
 #        qtype: "convrot8"
-        # --- VRAM: automatic layer offloading -------------------------------
-        # Streams transformer layers from CPU. "auto" starts from a percent
-        # computed from your VRAM + model size, then ADAPTIVELY lowers it during
-        # training while there's spare VRAM (faster) and raises it on OOM — it
-        # converges to using your card to the fullest, no trial & error.
-        # Pin an explicit 0.0-1.0 instead of "auto" to disable the auto-tuning.
-        # AITK_ADAPTIVE_OFFLOAD=0 disables the loop; AITK_OFFLOAD_HEADROOM_GB
-        # sets the VRAM margin to keep free (default 0.7).
+        # --- VRAM: layer offloading -----------------------------------------
+        # Streams transformer layers from CPU. The percent is the STARTING value
+        # and, by default, stays FIXED for the whole run (rock-solid).
+        #   - a number 0.0-1.0 : use it directly (recommended — pick one that
+        #                        fits your card once, e.g. 0.47, and it's stable).
+        #   - "auto"           : size it once at load from VRAM + model size.
         layer_offloading: true
-        layer_offloading_transformer_percent: auto
-        layer_offloading_text_encoder_percent: auto
-        # Only the STARTING offload estimate's safety margin (GB). The adaptive
-        # controller then converges to using the card fully, so this just sets how
-        # close the first step starts — keep it small (1-1.5) so it starts near
-        # the target. The live free-VRAM margin the controller keeps is separate:
-        # AITK_OFFLOAD_HEADROOM_GB (default 0.6, i.e. it'll push peak to ~total-0.6).
+        layer_offloading_transformer_percent: 0.47
+        layer_offloading_text_encoder_percent: 1.0
+        # Starting-estimate margin (GB) used only when the percent is "auto".
         layer_offloading_reserved_gb: 1.5
+        # OPTIONAL adaptive re-tuning: 0/absent = OFF (fixed offload, safest).
+        # Set a positive N to re-tune the offload every N steps to use the card
+        # more fully — EXPERIMENTAL (re-attaches the memory manager live; can be
+        # unstable with quantization/multi-resolution). Tune the free margin it
+        # keeps with AITK_OFFLOAD_HEADROOM_GB (default 0.6).
+#        layer_offloading_adjust_every: 50
         model_kwargs:
           # Offline training: load the text encoder / VAE / checkpoints from the
           # local HF cache only (no network). Uncomment if you train offline.

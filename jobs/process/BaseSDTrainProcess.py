@@ -436,10 +436,13 @@ class BaseSDTrainProcess(BaseTrainProcess):
         AITK_ADAPTIVE_OFFLOAD=0; set the free margin with AITK_OFFLOAD_HEADROOM_GB
         (default 0.6)."""
         try:
-            if not (
-                self.model_config.layer_offloading
-                and self.model_config.layer_offloading_transformer_auto
-            ):
+            # Re-tuning is OFF unless layer_offloading_adjust_every > 0. When off,
+            # the offload never changes mid-run (no memory-manager re-attach), which
+            # is rock-solid; the starting value (numeric or "auto") is used as-is.
+            adjust_every = int(
+                getattr(self.model_config, "layer_offloading_adjust_every", 0) or 0
+            )
+            if not self.model_config.layer_offloading or adjust_every <= 0:
                 return
             if os.environ.get("AITK_ADAPTIVE_OFFLOAD", "1") == "0":
                 return
@@ -454,7 +457,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 except ValueError:
                     headroom_gb = 0.6
                 tuner = {
-                    "seen": 0, "steps_since": 0, "warmup": 6, "interval": 8,
+                    "seen": 0, "steps_since": 0, "warmup": 6, "interval": adjust_every,
                     "min_step": 0.02, "damping": 0.7, "headroom_gb": headroom_gb,
                     # lowering is cautious: needs this much EXTRA room, and this
                     # many consecutive comfortable windows, before it lowers.
@@ -2805,14 +2808,15 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 optimizer.zero_grad(set_to_none=True)
                 flush()
                 torch.cuda.ipc_collect()
-                # try to actually recover: raise the transformer offload level so
-                # the next step has more headroom (supported models only; no-op
-                # otherwise). Best-effort — falls back to just skipping the batch.
+                # Only re-attach the memory manager (raise offload) if adaptive
+                # re-tuning is explicitly enabled; otherwise just skip the batch —
+                # mid-run re-attach is experimental and can corrupt device placement.
                 new_pct = None
-                try:
-                    new_pct = self.sd.try_increase_layer_offload()
-                except Exception as e:  # noqa: BLE001
-                    print_acc(f"# auto-offload recovery failed: {e}")
+                if int(getattr(self.model_config, "layer_offloading_adjust_every", 0) or 0) > 0:
+                    try:
+                        new_pct = self.sd.try_increase_layer_offload()
+                    except Exception as e:  # noqa: BLE001
+                        print_acc(f"# auto-offload recovery failed: {e}")
                 # skip this step and keep going
                 print_acc("")
                 print_acc("################################################")
