@@ -736,6 +736,37 @@ class Krea2Model(BaseModel):
             f"sample_linear_names={sample_names}"
         )
 
+        # PROBE: replicate create_modules' outer/inner matching by hand so we see
+        # exactly why LoRASpecialNetwork ends up with 0 modules. If would_create>0
+        # here but the network still builds 0, the divergence is inside
+        # LoRASpecialNetwork (a skip we haven't spotted); if would_create==0 the
+        # target/class matching itself is wrong.
+        try:
+            from toolkit.lorm import count_parameters
+
+            tgts = self.target_lora_modules
+            root_matches = sum(
+                1 for _, m in transformer.named_modules()
+                if m.__class__.__name__ in tgts
+            )
+            would_create, probe = 0, []
+            for _, container in transformer.named_modules():
+                if container.__class__.__name__ in tgts:
+                    for cn, cm in container.named_modules():
+                        if cm.__class__.__name__ in LINEAR_MODULES:
+                            would_create += 1
+                            if len(probe) < 3:
+                                probe.append(
+                                    f"{cn}[{cm.__class__.__name__}] "
+                                    f"params={count_parameters(cm)}"
+                                )
+            print(
+                f"[sample-lora] {name}: PROBE target_class_matches={root_matches} "
+                f"would_create~{would_create} first={probe}"
+            )
+        except Exception as e:  # noqa: BLE001
+            print(f"[sample-lora] {name}: PROBE failed: {e}")
+
         def build(target_lin_modules, transformer_only):
             # network build populates unet_loras in __init__; apply_to (forward
             # patching) is done later only on the chosen network.

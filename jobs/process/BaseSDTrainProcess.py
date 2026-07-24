@@ -1921,6 +1921,10 @@ class BaseSDTrainProcess(BaseTrainProcess):
                         if lora.path not in sample_lora_paths:
                             sample_lora_paths.append(lora.path)
             self.sd._pending_sample_lora_paths = sample_lora_paths
+            print_acc(
+                f"[sample-lora] collected {len(sample_lora_paths)} path(s) at load: "
+                f"{sample_lora_paths}"
+            )
         except Exception as e:  # noqa: BLE001
             print_acc(f"[sample-lora] could not collect paths: {e}")
         # run base sd process run
