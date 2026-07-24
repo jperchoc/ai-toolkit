@@ -292,6 +292,22 @@ class BaseModel:
         """
         return None
 
+    # --- sample loras (stack extra loras on generated samples) --------------
+    # Default: unsupported -> no-op. Models with their own lora system (e.g.
+    # krea2) override these to load/activate the loras carried on each
+    # GenerateImageConfig.loras during sampling and deactivate them after.
+    def prepare_sample_loras(self, image_configs) -> bool:
+        """Load/apply the extra sample loras. Returns True if any are active."""
+        return False
+
+    def set_sample_loras_for_config(self, gen_config) -> None:
+        """Set each sample lora's weight for the current sample."""
+        pass
+
+    def end_sample_loras(self) -> None:
+        """Deactivate the sample loras so training is unaffected."""
+        pass
+
     def get_generation_pipeline(self):
         # override this in child classes
         raise NotImplementedError(
@@ -436,6 +452,10 @@ class BaseModel:
         if network is not None:
             start_multiplier = network.multiplier
 
+        # extra sample loras (e.g. turbo + style) stacked on the samples so they
+        # look like the production result. No-op unless the model supports it.
+        sample_loras_active = self.prepare_sample_loras(image_configs)
+
         # pipeline.to(self.device_torch)
 
         with network:
@@ -492,6 +512,8 @@ class BaseModel:
 
                     if network is not None:
                         network.multiplier = gen_config.network_multiplier
+                    if sample_loras_active:
+                        self.set_sample_loras_for_config(gen_config)
                     torch.manual_seed(gen_config.seed)
                     torch.cuda.manual_seed(gen_config.seed)
 
@@ -700,6 +722,10 @@ class BaseModel:
         self.unet.to(self.device_torch, dtype=self.torch_dtype)
         if network.is_merged_in:
             network.merge_out(merge_multiplier)
+
+        # deactivate the sample loras so training is unaffected
+        if sample_loras_active:
+            self.end_sample_loras()
         # self.tokenizer.to(original_device_dict['tokenizer'])
 
         # refuse loras

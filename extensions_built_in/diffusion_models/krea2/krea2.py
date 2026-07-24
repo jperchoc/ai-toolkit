@@ -267,6 +267,10 @@ class Krea2Model(BaseModel):
         # level on the fly (see try_increase_layer_offload).
         self._offload_ctx = None
 
+        # Extra loras stacked on samples (path -> LoRASpecialNetwork), built lazily
+        # and reused across sample steps. See prepare_sample_loras.
+        self._sample_lora_networks = {}
+
     @staticmethod
     def get_train_scheduler():
         return CustomFlowMatchEulerDiscreteScheduler(**scheduler_config)
@@ -615,6 +619,122 @@ class Krea2Model(BaseModel):
         except Exception as e:  # noqa: BLE001 - recovery must never crash training
             print(f"[auto-offload] failed to raise transformer offload: {e}")
             return None
+
+    # ------------------------------------------------------------------
+    # Sample loras (stack extra loras on generated samples)
+    # ------------------------------------------------------------------
+    def _load_sample_lora_network(self, lora_path: str) -> "LoRASpecialNetwork":
+        """Build a LoRASpecialNetwork for an extra sample lora, applied to the
+        transformer but inactive (multiplier 0). Same krea2 lora machinery as the
+        training adapter. Logs how many keys matched so a format mismatch is
+        obvious."""
+        resolved = lora_path
+        if not os.path.exists(resolved):
+            splits = resolved.split("/")
+            if len(splits) < 3:
+                raise FileNotFoundError(
+                    f"Sample lora '{lora_path}' is not a local file and not a "
+                    "valid hub path (org/repo/file)."
+                )
+            resolved = huggingface_hub.hf_hub_download(
+                repo_id="/".join(splits[:2]),
+                filename="/".join(splits[2:]),
+                token=HF_TOKEN,
+                local_files_only=self.offline,
+            )
+
+        state_dict = load_file(resolved)
+        # remap ComfyUI/diffusers "diffusion_model." prefix to ai-toolkit's
+        state_dict = {
+            k.replace("diffusion_model.", "transformer."): v
+            for k, v in state_dict.items()
+        }
+        down_key = next(
+            (
+                k for k in state_dict
+                if k.endswith("lora_A.weight") or k.endswith("lora_down.weight")
+            ),
+            None,
+        )
+        if down_key is None:
+            raise ValueError(
+                f"No lora_A/lora_down weights in {os.path.basename(resolved)} — "
+                "unsupported lora format for krea2."
+            )
+        dim = int(state_dict[down_key].shape[0])
+
+        network_config = NetworkConfig(
+            type="lora", linear=dim, linear_alpha=dim, transformer_only=True
+        )
+        LoRASpecialNetwork.LORA_PREFIX_UNET = "lora_transformer"
+        network = LoRASpecialNetwork(
+            text_encoder=None,
+            unet=self.model,
+            lora_dim=network_config.linear,
+            multiplier=0.0,
+            alpha=network_config.linear_alpha,
+            train_unet=True,
+            train_text_encoder=False,
+            network_config=network_config,
+            network_type=network_config.type,
+            transformer_only=network_config.transformer_only,
+            is_transformer=True,
+            target_lin_modules=self.target_lora_modules,
+            is_assistant_adapter=True,
+        )
+        network.apply_to(None, self.model, apply_text_encoder=False, apply_unet=True)
+        network.force_to(self.device_torch, dtype=self.torch_dtype)
+        network._update_torch_multiplier()
+        extra = network.load_weights(state_dict)
+        unmatched = 0 if extra is None else len(extra)
+        if unmatched:
+            print(
+                f"[sample-lora] WARNING: {unmatched} keys from "
+                f"{os.path.basename(resolved)} did not match the model — the lora "
+                "may be in an unexpected format and have little/no effect."
+            )
+        network.is_active = False
+        network.multiplier = 0.0
+        network._update_torch_multiplier()
+        return network
+
+    def prepare_sample_loras(self, image_configs) -> bool:
+        paths = []
+        for cfg in image_configs:
+            for lora in getattr(cfg, "loras", []) or []:
+                if lora.path not in paths:
+                    paths.append(lora.path)
+        if not paths:
+            return False
+        for p in paths:
+            if p not in self._sample_lora_networks:
+                try:
+                    self._sample_lora_networks[p] = self._load_sample_lora_network(p)
+                    self.print_and_status_update(f"[sample-lora] loaded {p}")
+                except Exception as e:  # noqa: BLE001
+                    print(f"[sample-lora] failed to load {p}: {e}")
+        active = False
+        for net in self._sample_lora_networks.values():
+            net.is_active = True
+            net.multiplier = 0.0
+            net._update_torch_multiplier()
+            active = True
+        return active
+
+    def set_sample_loras_for_config(self, gen_config) -> None:
+        weights = {
+            lora.path: lora.weight
+            for lora in (getattr(gen_config, "loras", []) or [])
+        }
+        for path, net in self._sample_lora_networks.items():
+            net.multiplier = float(weights.get(path, 0.0))
+            net._update_torch_multiplier()
+
+    def end_sample_loras(self) -> None:
+        for net in self._sample_lora_networks.values():
+            net.multiplier = 0.0
+            net.is_active = False
+            net._update_torch_multiplier()
 
     # ------------------------------------------------------------------
     # Generation (training previews)
