@@ -697,66 +697,88 @@ class Krea2Model(BaseModel):
             )
         dim = int(raw_sd[down_key].shape[0])
 
-        network_config = NetworkConfig(
-            type="lora", linear=dim, linear_alpha=dim, transformer_only=True
-        )
         LoRASpecialNetwork.LORA_PREFIX_UNET = "lora_transformer"
-        # Mirror the trainer's own network build (base_model=self + get_model_to_train)
-        # so the lora attaches to the same (quantized) block modules it does.
         transformer = self.get_model_to_train()
 
-        def build(target_lin_modules):
+        # ALWAYS log the transformer structure (cheap) so an attach failure is
+        # diagnosable in ONE run instead of a bare "no lora modules".
+        from toolkit.lora_special import LINEAR_MODULES
+
+        linear_present, sample_names = {}, []
+        for nm, mod in transformer.named_modules():
+            cn = mod.__class__.__name__
+            if cn in LINEAR_MODULES:
+                linear_present[cn] = linear_present.get(cn, 0) + 1
+                if len(sample_names) < 8:
+                    sample_names.append(nm)
+        print(
+            f"[sample-lora] {name}: DIAG root={transformer.__class__.__name__} "
+            f"target={self.target_lora_modules} linear_modules={linear_present} "
+            f"sample_linear_names={sample_names}"
+        )
+
+        def build(target_lin_modules, transformer_only):
+            # network build populates unet_loras in __init__; apply_to (forward
+            # patching) is done later only on the chosen network.
+            nc = NetworkConfig(
+                type="lora", linear=dim, linear_alpha=dim,
+                transformer_only=transformer_only,
+            )
             net = LoRASpecialNetwork(
                 text_encoder=None,
                 unet=transformer,
-                lora_dim=network_config.linear,
+                lora_dim=nc.linear,
                 multiplier=0.0,
-                alpha=network_config.linear_alpha,
+                alpha=nc.linear_alpha,
                 train_unet=True,
                 train_text_encoder=False,
-                network_config=network_config,
-                network_type=network_config.type,
-                transformer_only=network_config.transformer_only,
+                network_config=nc,
+                network_type=nc.type,
+                transformer_only=transformer_only,
                 is_transformer=self.is_transformer,
                 base_model=self,
                 target_lin_modules=target_lin_modules,
                 is_assistant_adapter=True,
             )
-            net.apply_to(None, transformer, apply_text_encoder=False, apply_unet=True)
             return net, len(getattr(net, "unet_loras", []) or [])
 
-        # Try the configured target first; if it attaches nothing, fall back to the
-        # transformer's own root class (guarantees we descend into all its linears).
-        targets = []
-        for t in (self.target_lora_modules, [transformer.__class__.__name__]):
-            if t and t not in targets:
-                targets.append(t)
-        network, n_modules = None, 0
+        # Try, in order: configured target, then the transformer's own root class;
+        # each with the block-only filter ON then OFF. transformer_only=False drops
+        # the "blocks" name filter (the usual reason nothing attaches). Extra
+        # linears that get no loaded weight stay zero -> no effect, so this is safe.
+        targets = [self.target_lora_modules, [transformer.__class__.__name__]]
+        strategies = []
         for t in targets:
-            network, n_modules = build(t)
-            if n_modules > 0:
-                print(f"[sample-lora] {name}: attached {n_modules} modules (target={t})")
+            for tonly in (True, False):
+                if t and (t, tonly) not in strategies:
+                    strategies.append((t, tonly))
+
+        network, n_modules = None, 0
+        for t, tonly in strategies:
+            try:
+                net, n = build(t, tonly)
+            except Exception as e:  # noqa: BLE001 - a 0-module build can raise here
+                print(
+                    f"[sample-lora] {name}: target={t} transformer_only={tonly} "
+                    f"errored: {e}"
+                )
+                continue
+            print(
+                f"[sample-lora] {name}: target={t} transformer_only={tonly} "
+                f"-> {n} modules"
+            )
+            if n > 0:
+                network, n_modules = net, n
                 break
-            print(f"[sample-lora] {name}: 0 modules with target={t}, trying next")
 
-        if n_modules == 0:
-            # tell us exactly what the transformer looks like so this is fixable
-            from toolkit.lora_special import LINEAR_MODULES
-
-            present, samples = {}, []
-            for nm, mod in transformer.named_modules():
-                cn = mod.__class__.__name__
-                if cn in LINEAR_MODULES:
-                    present[cn] = present.get(cn, 0) + 1
-                    if len(samples) < 8:
-                        samples.append(nm)
+        if network is None or n_modules == 0:
             raise ValueError(
-                f"{name}: lora attached to 0 modules. "
+                f"{name}: attached 0 lora modules with every strategy. "
                 f"root={transformer.__class__.__name__} "
-                f"tried_targets={targets} "
-                f"linear_modules_present={present} sample_names={samples}"
+                f"linear_modules={linear_present} sample_names={sample_names}"
             )
 
+        network.apply_to(None, transformer, apply_text_encoder=False, apply_unet=True)
         network.force_to(self.device_torch, dtype=self.torch_dtype)
         network._update_torch_multiplier()
 
