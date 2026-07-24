@@ -71,9 +71,12 @@ config:
         layer_offloading: true
         layer_offloading_transformer_percent: auto
         layer_offloading_text_encoder_percent: auto
-        # GB held back for activations/optimizer/VAE/TE. A number, or "auto" to
-        # derive it from total VRAM (~30%). Raise it if you still OOM.
-        layer_offloading_reserved_gb: 4.0
+        # Only the STARTING offload estimate's safety margin (GB). The adaptive
+        # controller then converges to using the card fully, so this just sets how
+        # close the first step starts — keep it small (1-1.5) so it starts near
+        # the target. The live free-VRAM margin the controller keeps is separate:
+        # AITK_OFFLOAD_HEADROOM_GB (default 0.6, i.e. it'll push peak to ~total-0.6).
+        layer_offloading_reserved_gb: 1.5
         model_kwargs:
           # Offline training: load the text encoder / VAE / checkpoints from the
           # local HF cache only (no network). Uncomment if you train offline.

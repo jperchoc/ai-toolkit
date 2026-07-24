@@ -301,6 +301,11 @@ class BaseModel:
         """Current transformer offload percent, or None if not offloading."""
         return None
 
+    def get_transformer_weight_gb(self):
+        """Total transformer weight footprint in GB, used to size the adaptive
+        offload step proportionally (GB <-> percent). None if unknown."""
+        return None
+
     # --- sample loras (stack extra loras on generated samples) --------------
     # Default: unsupported -> no-op. Models with their own lora system (e.g.
     # krea2) override these to load/activate the loras carried on each

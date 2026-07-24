@@ -266,6 +266,7 @@ class Krea2Model(BaseModel):
         # Stored so an OOM in the training loop can raise the transformer offload
         # level on the fly (see try_increase_layer_offload).
         self._offload_ctx = None
+        self._transformer_weight_gb = None  # cached for proportional offload steps
 
         # Extra loras stacked on samples, applied via direct forward hooks on the
         # transformer's linear modules (NOT LoRASpecialNetwork, which wouldn't
@@ -616,6 +617,24 @@ class Krea2Model(BaseModel):
         if not self._offload_ctx:
             return None
         return self.model_config.layer_offloading_transformer_percent
+
+    def get_transformer_weight_gb(self) -> Optional[float]:
+        """Total transformer weight footprint (GB), cached. Lets the adaptive
+        controller size its step proportionally: to change resident VRAM by G GB,
+        change the offload percent by ~G / weight_gb."""
+        if self._transformer_weight_gb is not None:
+            return self._transformer_weight_gb
+        m = self.get_model_to_train()
+        if m is None:
+            return None
+        seen, total = set(), 0
+        for t in list(m.parameters()) + list(m.buffers()):
+            if t is None or id(t) in seen:
+                continue
+            seen.add(id(t))
+            total += t.numel() * t.element_size()
+        self._transformer_weight_gb = total / (1024 ** 3)
+        return self._transformer_weight_gb
 
     def _set_layer_offload_percent(self, new_percent: float) -> Optional[float]:
         """Re-attach the memory manager at a new offload percent (best-effort).
