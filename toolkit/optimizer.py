@@ -65,9 +65,6 @@ def get_optimizer(
 
         if lower_type == "adam8bit":
             return bitsandbytes.optim.Adam8bit(params, lr=learning_rate, eps=1e-6, **optimizer_params)
-        if lower_type == "paged_adamw8bit":
-            # paged optimizer state survives VRAM spikes by paging to host memory
-            return bitsandbytes.optim.PagedAdamW8bit(params, lr=learning_rate, eps=1e-6, **optimizer_params)
         if lower_type == "ademamix8bit":
             return bitsandbytes.optim.AdEMAMix8bit(params, lr=learning_rate, eps=1e-6, **optimizer_params)
         elif lower_type == "adamw8bit":
@@ -109,6 +106,11 @@ def get_optimizer(
     elif lower_type == 'automagicexperiment':
         from toolkit.optimizers.automagicEXPERIMENT import AutomagicEXPERIMENT
         optimizer = AutomagicEXPERIMENT(params, lr=float(learning_rate), **optimizer_params)
+    elif lower_type == 'adamconvrot':
+        from toolkit.optimizers.adamconvrot import AdamConvRot
+        if 'eps' not in optimizer_params:
+            optimizer_params['eps'] = 1e-6
+        optimizer = AdamConvRot(params, lr=float(learning_rate), **optimizer_params)
     else:
         raise ValueError(f'Unknown optimizer type {optimizer_type}')
     return optimizer

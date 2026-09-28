@@ -25,18 +25,21 @@ from safetensors.torch import load_file, save_file
 
 import huggingface_hub
 from huggingface_hub.errors import EntryNotFoundError
-from diffusers import AutoencoderKLQwenImage
 from transformers import (
     AutoProcessor,
     AutoTokenizer,
     Qwen2TokenizerFast,
-    Qwen3VLForConditionalGeneration,
 )
 from optimum.quanto import freeze
 
 from toolkit.config_modules import GenerateImageConfig, ModelConfig, NetworkConfig
 from toolkit.lora_special import LoRASpecialNetwork
 from toolkit.models.base_model import BaseModel
+from toolkit.models.v2.vae.qwen_image import QwenImageVAE, QwenImageVAEHolderMixin
+from toolkit.models.v2.text_encoders.qwen3_vl import (
+    Qwen3VLTextEncoder,
+    patch_qwen_vl_patch_embed,
+)
 from toolkit.basic import flush
 from toolkit.advanced_prompt_embeds import AdvancedPromptEmbeds
 from toolkit.samplers.custom_flowmatch_sampler import (
@@ -44,8 +47,7 @@ from toolkit.samplers.custom_flowmatch_sampler import (
 )
 from toolkit.accelerator import unwrap_model
 from toolkit.metadata import get_meta_for_safetensors
-from toolkit.util.quantize import quantize, get_qtype, quantize_model
-from toolkit.memory_management import MemoryManager, compute_offload_percent
+from toolkit.memory_management import MemoryManager
 
 from .src.mmdit import (
     DoubleSharedModulation,
@@ -100,69 +102,12 @@ QWEN_IMAGE_VAE_PATH = "Qwen/Qwen-Image"
 HF_TOKEN = os.getenv("HF_TOKEN", None)
 
 
-def _hf_offline_from_env() -> bool:
-    """True if the standard HF offline env vars are set."""
-    for var in ("HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE"):
-        val = os.getenv(var, "0")
-        if val not in ("0", "", "false", "False"):
-            return True
-    return False
-
-
-def _ensure_cached_offline(repo_id: str, filename: str, what: str) -> None:
-    """Offline pre-flight: fail fast with an actionable message if a hub repo
-    isn't in the local cache, instead of a deep from_pretrained traceback.
-    Skipped for local directory paths (which are always available)."""
-    if os.path.isdir(repo_id) or os.path.isfile(repo_id):
-        return
-    try:
-        cached = huggingface_hub.try_to_load_from_cache(repo_id, filename)
-    except Exception:
-        cached = None
-    # a str path means it's present; None or the _CACHED_NO_EXIST sentinel mean not
-    if not isinstance(cached, str):
-        raise FileNotFoundError(
-            f"Offline mode: {what} '{repo_id}' is not in the local HF cache "
-            f"(looked for '{filename}'). Download it once online, or set "
-            f"model.model_kwargs.{'text_encoder_path' if what == 'text encoder' else 'vae_path'} "
-            f"to a local folder."
-        )
-
-
-def patch_qwen_vl_patch_embed(model):
-    """Qwen-VL's vision patch_embed is a Conv3d whose kernel == stride, i.e. a plain
-    linear projection of each flattened patch. bf16 Conv3d has no fast cuDNN kernel and
-    falls back to a slow, GPU-underutilizing path. Swap it for the equivalent F.linear
-    (a GEMM). The weight is read lazily so this survives later .to(device)/dtype moves.
-    Returns the number of patch_embed modules patched. (Same patch as the
-    Qwen3VLCaptioner extension.)"""
-    patched = 0
-    for module in model.modules():
-        proj = getattr(module, "proj", None)
-        if isinstance(proj, torch.nn.Conv3d) and tuple(proj.kernel_size) == tuple(
-            proj.stride
-        ):
-
-            def fast_forward(hidden_states, _proj=proj):
-                w = _proj.weight.reshape(_proj.weight.shape[0], -1)
-                x = hidden_states.view(-1, w.shape[1]).to(w.dtype)
-                return F.linear(x, w, _proj.bias)
-
-            module.forward = fast_forward
-            patched += 1
-    return patched
-
-
-def _load_mmdit_state_dict(
-    name_or_path: str, filename: Optional[str], local_files_only: bool = False
-) -> dict:
+def _load_mmdit_state_dict(name_or_path: str, filename: Optional[str]) -> dict:
     """Load the MMDiT weights from a local safetensors file/dir or the HF hub.
 
     ``name_or_path`` may be: a ``.safetensors`` file, a directory containing one
     (``filename`` or the lone ``.safetensors`` in it), or a hub repo id (the
     file ``filename`` is downloaded, defaulting to ``model.safetensors``).
-    ``local_files_only`` forces the hub lookup to use only the local cache
-    (offline training).
     """
     if name_or_path.endswith(".safetensors") and os.path.isfile(name_or_path):
         return load_file(name_or_path)
@@ -186,10 +131,7 @@ def _load_mmdit_state_dict(
     )
     try:
         path = huggingface_hub.hf_hub_download(
-            repo_id=name_or_path,
-            filename=fname,
-            token=HF_TOKEN,
-            local_files_only=local_files_only,
+            repo_id=name_or_path, filename=fname, token=HF_TOKEN
         )
     except EntryNotFoundError as e:
         raise FileNotFoundError(
@@ -199,7 +141,7 @@ def _load_mmdit_state_dict(
     return load_file(path)
 
 
-class Krea2Model(BaseModel):
+class Krea2Model(QwenImageVAEHolderMixin, BaseModel):
     arch = "krea2"
 
     def __init__(
@@ -255,15 +197,6 @@ class Krea2Model(BaseModel):
         # node / hub pipeline kv_cache toggles) to work properly.
         self.kv_cache = bool(self.model_config.model_kwargs.get("kv_cache", False))
 
-        # Offline training: load the text encoder / VAE / checkpoints from the
-        # local HF cache only, never hitting the network. Enabled by
-        # model_kwargs.offline: true or the standard HF offline env vars. Local
-        # directory paths are always treated as offline.
-        self.offline = bool(
-            self.model_config.model_kwargs.get("offline", False)
-        ) or _hf_offline_from_env()
-
-
         # Extra loras stacked on samples, applied via direct forward hooks on the
         # transformer's linear modules (NOT LoRASpecialNetwork, which wouldn't
         # attach here). path -> handle dict {multiplier, active, handles, matched}.
@@ -290,22 +223,15 @@ class Krea2Model(BaseModel):
         mmdit_kwargs.update(self.model_config.model_kwargs.get("mmdit_config", {}))
         config = SingleMMDiTConfig(**mmdit_kwargs)
 
-        # Build on meta, then materialize straight from the checkpoint.
-        with torch.device("meta"):
-            transformer = SingleStreamDiT(config)
-
         self.print_and_status_update("  - fetching transformer weights")
         state_dict = _load_mmdit_state_dict(
             self.model_config.name_or_path,
             self.model_config.model_kwargs.get("checkpoint_filename", None),
-            local_files_only=self.offline,
         )
-        state_dict = {
-            k: (v.to(dtype) if v.is_floating_point() else v)
-            for k, v in state_dict.items()
-        }
         self.print_and_status_update("  - loading transformer state dict")
-        transformer.load_state_dict(state_dict, strict=True, assign=True)
+        transformer = SingleStreamDiT.load_from_state_dict(
+            state_dict, dtype, config=config
+        )
         del state_dict
         flush()
         return transformer
@@ -313,41 +239,28 @@ class Krea2Model(BaseModel):
     def _load_text_encoder(self):
         dtype = self.torch_dtype
         te_path = self.model_config.model_kwargs.get("text_encoder_path", QWEN3_VL_PATH)
-        # A local directory is inherently offline; a repo id needs the flag/env.
-        local_only = self.offline or os.path.isdir(te_path)
-        if local_only:
-            _ensure_cached_offline(te_path, "config.json", "text encoder")
-        self.print_and_status_update(
-            f"Loading Qwen3-VL text encoder from {te_path}"
-            + (" (local only)" if local_only else "")
-        )
+        self.print_and_status_update(f"Loading Qwen3-VL text encoder from {te_path}")
 
         tokenizer = AutoTokenizer.from_pretrained(
-            te_path, max_length=self.max_text_length, token=HF_TOKEN,
-            local_files_only=local_only,
+            te_path, max_length=self.max_text_length, token=HF_TOKEN
         )
         processor = Qwen2TokenizerFast.from_pretrained(
-            te_path, max_length=self.max_text_length, token=HF_TOKEN,
-            local_files_only=local_only,
+            te_path, max_length=self.max_text_length, token=HF_TOKEN
         )
-        text_encoder = Qwen3VLForConditionalGeneration.from_pretrained(
-            te_path, torch_dtype=dtype, token=HF_TOKEN,
-            local_files_only=local_only,
+        text_encoder = Qwen3VLTextEncoder.load_model(
+            te_path, dtype=dtype, subfolder="", token=HF_TOKEN
         )
         vl_processor = None
         if self.is_edit:
             # Edit mode: reference images are encoded into the text embeddings,
             # so the vision tower stays. Swap its Conv3d patch_embed for an
             # equivalent GEMM (bf16 Conv3d has no fast cuDNN kernel).
-            vl_processor = AutoProcessor.from_pretrained(
-                te_path, token=HF_TOKEN, local_files_only=local_only
-            )
+            vl_processor = AutoProcessor.from_pretrained(te_path, token=HF_TOKEN)
             patch_qwen_vl_patch_embed(text_encoder)
         else:
             # We only ever encode text, so the vision tower is dead weight -- drop it to
             # free VRAM and skip loading its (bf16-slow) Conv3d patch_embed onto the GPU.
-            if getattr(text_encoder.model, "visual", None) is not None:
-                text_encoder.model.visual = None
+            text_encoder.drop_vision_tower()
         text_encoder.eval()
         text_encoder.requires_grad_(False)
         flush()
@@ -355,13 +268,9 @@ class Krea2Model(BaseModel):
 
     def _load_vae(self):
         vae_path = self.model_config.model_kwargs.get("vae_path", QWEN_IMAGE_VAE_PATH)
-        local_only = self.offline or os.path.isdir(vae_path)
-        if local_only:
-            _ensure_cached_offline(vae_path, "vae/config.json", "VAE")
         self.print_and_status_update(f"Loading Qwen-Image VAE from {vae_path}")
-        vae = AutoencoderKLQwenImage.from_pretrained(
-            vae_path, subfolder="vae", torch_dtype=self.vae_torch_dtype, token=HF_TOKEN,
-            local_files_only=local_only,
+        vae = QwenImageVAE.load_model(
+            vae_path, dtype=self.vae_torch_dtype, token=HF_TOKEN
         )
         vae.eval()
         vae.requires_grad_(False)
@@ -471,13 +380,6 @@ class Krea2Model(BaseModel):
         dtype = self.torch_dtype
         self.print_and_status_update("Loading Krea 2 model")
 
-        if self.offline:
-            # Make the whole HF stack (transformers/diffusers/hub) cache-only, so
-            # tokenizer/processor/model/VAE never try to reach the network.
-            os.environ["HF_HUB_OFFLINE"] = "1"
-            os.environ["TRANSFORMERS_OFFLINE"] = "1"
-            self.print_and_status_update("Offline mode: using local HF cache only")
-
         transformer = self._load_transformer()
 
         # load assistant lora if specified
@@ -487,72 +389,12 @@ class Krea2Model(BaseModel):
             if self.model_config.qtype == "qfloat8":
                 self.model_config.qtype = "float8"
 
-        if self.model_config.quantize:
-            self.print_and_status_update("Quantizing transformer")
-            quantize_model(self, transformer)
-            flush()
-
-        if self.model_config.layer_offloading:
-            # Resolve an "auto" percent from the VRAM budget now (transformer is
-            # still on CPU here, so its weight size is easy to measure).
-            if self.model_config.layer_offloading_transformer_auto:
-                self.model_config.layer_offloading_transformer_percent = (
-                    compute_offload_percent(
-                        transformer,
-                        self.device_torch,
-                        reserved_gb=self.model_config.layer_offloading_reserved_gb,
-                        label="transformer",
-                    )
-                )
-            if self.model_config.layer_offloading_transformer_percent > 0:
-                ignore_modules = [
-                    module
-                    for module in transformer.modules()
-                    if isinstance(module, (SimpleModulation, DoubleSharedModulation))
-                ]
-                MemoryManager.attach(
-                    transformer,
-                    self.device_torch,
-                    offload_percent=self.model_config.layer_offloading_transformer_percent,
-                    ignore_modules=ignore_modules,
-                )
-
-        if self.model_config.low_vram:
-            self.print_and_status_update("Moving transformer to CPU")
-            transformer.to("cpu")
-        else:
-            transformer.to(self.device_torch, dtype=dtype)
+        # quantize + offload + placement, all driven by model_config
+        transformer.aitk_post_load(**self.component_load_kwargs("transformer"))
         flush()
 
         tokenizer, processor, vl_processor, text_encoder = self._load_text_encoder()
-        if self.model_config.quantize_te:
-            self.print_and_status_update("Quantizing text encoder")
-            text_encoder.to(self.device_torch)
-            quantize(text_encoder, weights=get_qtype(self.model_config.qtype_te))
-            freeze(text_encoder)
-            flush()
-        if self.model_config.layer_offloading:
-            if self.model_config.layer_offloading_text_encoder_auto:
-                self.model_config.layer_offloading_text_encoder_percent = (
-                    compute_offload_percent(
-                        text_encoder,
-                        self.device_torch,
-                        reserved_gb=self.model_config.layer_offloading_reserved_gb,
-                        label="text_encoder",
-                    )
-                )
-            if self.model_config.layer_offloading_text_encoder_percent > 0:
-                MemoryManager.attach(
-                    text_encoder,
-                    self.device_torch,
-                    offload_percent=self.model_config.layer_offloading_text_encoder_percent,
-                )
-
-        if self.model_config.low_vram:
-            self.print_and_status_update("Moving text encoder to CPU")
-            text_encoder.to("cpu")
-        else:
-            text_encoder.to(self.device_torch)
+        text_encoder.aitk_post_load(**self.component_load_kwargs("te"))
         flush()
 
         vae = self._load_vae()
@@ -566,23 +408,6 @@ class Krea2Model(BaseModel):
         self.processor = processor
         self.vl_processor = vl_processor
         self.model = transformer
-
-        # Optional torch.compile of the transformer (model_kwargs.compile_transformer:
-        # true). Off by default. Incompatible with layer offloading (per-layer CPU
-        # streaming breaks the graph) and works best at a single resolution, since
-        # multi-resolution buckets trigger recompiles.
-        if self.model_config.model_kwargs.get("compile_transformer", False):
-            if self.model_config.layer_offloading:
-                self.print_and_status_update(
-                    "compile_transformer ignored: incompatible with layer_offloading"
-                )
-            else:
-                try:
-                    self.model = torch.compile(self.model, mode="reduce-overhead")
-                    self.print_and_status_update("Transformer compiled (reduce-overhead)")
-                except Exception as e:  # noqa: BLE001
-                    self.print_and_status_update(f"torch.compile failed, continuing: {e}")
-
         # Build extra sample loras now — at load time, the same point the
         # training network attaches successfully (attaching mid-sampling was
         # failing with 0 modules). They stay inactive until sampling.
@@ -618,7 +443,6 @@ class Krea2Model(BaseModel):
             repo_id="/".join(splits[:2]),
             filename="/".join(splits[2:]),
             token=HF_TOKEN,
-            local_files_only=self.offline,
         )
 
     def _load_sample_lora_hooks(self, lora_path: str) -> dict:
@@ -1069,76 +893,9 @@ class Krea2Model(BaseModel):
         return False
 
     # ------------------------------------------------------------------
-    # VAE (Qwen-Image AutoencoderKLQwenImage -- same handling as qwen_image arch)
+    # VAE (Qwen-Image AutoencoderKLQwenImage -- shared QwenImageVAEHolderMixin)
     # ------------------------------------------------------------------
-    def encode_images(self, image_list: List[torch.Tensor], device=None, dtype=None):
-        if device is None:
-            device = self.vae_device_torch
-        if dtype is None:
-            dtype = self.vae_torch_dtype
-
-        if self.vae.device == torch.device("cpu"):
-            self.vae.to(device)
-        self.vae.eval()
-        self.vae.requires_grad_(False)
-
-        image_list = [image.to(device, dtype=dtype) for image in image_list]
-        images = torch.stack(image_list).to(device, dtype=dtype)
-
-        # AutoencoderKLQwenImage is a video VAE: add a frame dim.
-        images = images.unsqueeze(2)
-        latents = self.vae.encode(images).latent_dist.sample()
-
-        latents_mean = (
-            torch.tensor(self.vae.config.latents_mean)
-            .view(1, self.vae.config.z_dim, 1, 1, 1)
-            .to(latents.device, latents.dtype)
-        )
-        latents_std = 1.0 / torch.tensor(self.vae.config.latents_std).view(
-            1, self.vae.config.z_dim, 1, 1, 1
-        ).to(latents.device, latents.dtype)
-
-        latents = (latents - latents_mean) * latents_std
-        latents = latents.squeeze(2)  # drop frame dim
-        return latents.to(device, dtype=dtype)
-
-    def decode_latents(self, latents: torch.Tensor, device=None, dtype=None):
-        if device is None:
-            device = self.vae_device_torch
-        if dtype is None:
-            dtype = self.vae_torch_dtype
-
-        if self.vae.device == torch.device("cpu"):
-            self.vae.to(device)
-
-        latents = latents.to(device, dtype=dtype)
-        latents = latents.unsqueeze(2)  # add frame dim
-
-        latents_mean = (
-            torch.tensor(self.vae.config.latents_mean)
-            .view(1, self.vae.config.z_dim, 1, 1, 1)
-            .to(latents.device, latents.dtype)
-        )
-        latents_std = (
-            torch.tensor(self.vae.config.latents_std)
-            .view(1, self.vae.config.z_dim, 1, 1, 1)
-            .to(latents.device, latents.dtype)
-        )
-        latents = latents * latents_std + latents_mean
-
-        # Full-resolution decode spikes VRAM; tile it when low on VRAM (decode
-        # only -- encode stays untiled).
-        tiled = self.model_config.low_vram
-        if tiled:
-            self.vae.enable_tiling()
-        try:
-            images = self.vae.decode(latents).sample
-        finally:
-            if tiled:
-                self.vae.disable_tiling()
-        images = images.squeeze(2)  # drop frame dim
-        return images.to(device, dtype=dtype)
-
+    vae_decode_tiled_on_low_vram = True
     # ------------------------------------------------------------------
     # Saving / bookkeeping
     # ------------------------------------------------------------------
@@ -1164,14 +921,5 @@ class Krea2Model(BaseModel):
     def get_transformer_block_names(self) -> Optional[List[str]]:
         return ["blocks"]
 
-    def convert_lora_weights_before_save(self, state_dict):
-        return {
-            k.replace("transformer.", "diffusion_model."): v
-            for k, v in state_dict.items()
-        }
+    lora_keys_use_comfy_prefix = True
 
-    def convert_lora_weights_before_load(self, state_dict):
-        return {
-            k.replace("diffusion_model.", "transformer."): v
-            for k, v in state_dict.items()
-        }
