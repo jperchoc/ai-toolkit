@@ -199,6 +199,29 @@ def _is_quantized_tensor(t: Optional[torch.Tensor]) -> bool:
     return not t.dtype.is_floating_point
 
 
+def _dequantize_weight(w_q: torch.Tensor) -> torch.Tensor:
+    """Dequantize a staged quantized weight to a plain tensor.
+
+    Never hand back a still-quantized tensor: `.to(dtype)` on a torchao
+    AffineQuantizedTensor only changes its output dtype, and the backward's
+    `grad @ w` would then dispatch into torchao's aten.mm, which transposes the
+    weight and fails to dequantize it (block_size mismatch assertion). A CUDA OOM
+    here is usually allocator fragmentation, so free the cache and retry once."""
+    try:
+        return w_q.dequantize()
+    except torch.OutOfMemoryError:
+        torch.cuda.empty_cache()
+        return w_q.dequantize()
+    except Exception as e:
+        w_fp = w_q.to(dtype=torch.float32, non_blocking=True)
+        if _is_quantized_tensor(w_fp):
+            raise RuntimeError(
+                f"could not dequantize {type(w_q).__name__} weight of shape "
+                f"{tuple(w_q.shape)}"
+            ) from e
+        return w_fp
+
+
 def _pin_inner_tensors(t: torch.Tensor) -> None:
     """Pin the leaf storage of a tensor-subclass (e.g. torchao float8) in place.
 
@@ -319,10 +342,7 @@ class _BouncingLinearFn(torch.autograd.Function):
             if _is_quantized_tensor(cpu_w):
                 # move quantized wrapper to GPU -> dequantize on GPU -> cast on GPU
                 w_q_gpu = cpu_w.to(dev, non_blocking=True)
-                try:
-                    w_fp_gpu = w_q_gpu.dequantize()
-                except Exception:
-                    w_fp_gpu = w_q_gpu.to(dtype=torch.float32, non_blocking=True)
+                w_fp_gpu = _dequantize_weight(w_q_gpu)
                 if w_fp_gpu.dtype != target_dtype:
                     w_fp_gpu = w_fp_gpu.to(target_dtype, non_blocking=True)
                 return w_fp_gpu
@@ -403,10 +423,7 @@ class _BouncingLinearFn(torch.autograd.Function):
         def _materialize_for_bwd(cpu_w):
             if _is_quantized_tensor(cpu_w):
                 w_q_gpu = cpu_w.to(device, non_blocking=True)
-                try:
-                    w_fp_gpu = w_q_gpu.dequantize()
-                except Exception:
-                    w_fp_gpu = w_q_gpu.to(dtype=torch.float32, non_blocking=True)
+                w_fp_gpu = _dequantize_weight(w_q_gpu)
                 if w_fp_gpu.dtype != target_dtype:
                     w_fp_gpu = w_fp_gpu.to(target_dtype, non_blocking=True)
                 return w_fp_gpu
@@ -470,10 +487,7 @@ class _BouncingConv2dFn(torch.autograd.Function):
         def _materialize_conv_weight(cpu_w, dev):
             if _is_quantized_tensor(cpu_w):
                 w_q_gpu = cpu_w.to(dev, non_blocking=True)
-                try:
-                    w_fp_gpu = w_q_gpu.dequantize()
-                except Exception:
-                    w_fp_gpu = w_q_gpu.to(dtype=torch.float32, non_blocking=True)
+                w_fp_gpu = _dequantize_weight(w_q_gpu)
                 if w_fp_gpu.dtype != target_dtype:
                     w_fp_gpu = w_fp_gpu.to(target_dtype, non_blocking=True)
                 return w_fp_gpu
@@ -581,10 +595,7 @@ class _BouncingConv2dFn(torch.autograd.Function):
         def _materialize_for_bwd(cpu_w):
             if _is_quantized_tensor(cpu_w):
                 w_q_gpu = cpu_w.to(device, non_blocking=True)
-                try:
-                    w_fp_gpu = w_q_gpu.dequantize()
-                except Exception:
-                    w_fp_gpu = w_q_gpu.to(dtype=torch.float32, non_blocking=True)
+                w_fp_gpu = _dequantize_weight(w_q_gpu)
                 if w_fp_gpu.dtype != target_dtype:
                     w_fp_gpu = w_fp_gpu.to(target_dtype, non_blocking=True)
                 return w_fp_gpu
