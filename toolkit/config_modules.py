@@ -732,6 +732,19 @@ class ModelConfig:
         self.unet_sample_size = kwargs.get("unet_sample_size", None)
         self.vae_device = kwargs.get("vae_device", None)
         self.vae_dtype = kwargs.get("vae_dtype", self.dtype)
+        # tile the VAE encode to cut its VRAM peak (latent caching at high res).
+        # Only honored by models whose VAE supports diffusers-style encode tiling
+        # (currently the Qwen-Image VAE: qwen_image family, nucleus_image, krea2).
+        self.vae_tiling = kwargs.get("vae_tiling", False)
+        self.vae_tile_size = int(kwargs.get("vae_tile_size", 512))  # in pixels
+        self.vae_tile_overlap = int(kwargs.get("vae_tile_overlap", 64))  # in pixels
+        if self.vae_tiling:
+            if self.vae_tile_size <= 0 or self.vae_tile_size % 8 != 0:
+                raise ValueError("vae_tile_size must be a positive multiple of 8")
+            if self.vae_tile_overlap < 0 or self.vae_tile_overlap % 8 != 0:
+                raise ValueError("vae_tile_overlap must be a non-negative multiple of 8")
+            if self.vae_tile_overlap >= self.vae_tile_size:
+                raise ValueError("vae_tile_overlap must be smaller than vae_tile_size")
         self.te_device = kwargs.get("te_device", None)
         self.te_dtype = kwargs.get("te_dtype", self.dtype)
 
