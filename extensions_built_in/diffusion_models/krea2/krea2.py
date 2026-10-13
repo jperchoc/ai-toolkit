@@ -15,6 +15,7 @@ target = noise - clean), so ``get_noise_prediction`` does no time flip / negatio
 
 import math
 import os
+import re
 from typing import TYPE_CHECKING, List, Optional
 
 import torch
@@ -139,6 +140,91 @@ def _load_mmdit_state_dict(name_or_path: str, filename: Optional[str]) -> dict:
             "model.model_kwargs.checkpoint_filename to the weight file name."
         ) from e
     return load_file(path)
+
+
+# diffusers-format krea2 module names -> the original names used by src/mmdit.py
+_DIFFUSERS_TO_KREA2 = (
+    (re.compile(r"(^|\.)transformer_blocks\."), r"\1blocks."),
+    (re.compile(r"(^|\.)text_fusion\."), r"\1txtfusion."),
+    (re.compile(r"\.attn\.to_q$"), ".attn.wq"),
+    (re.compile(r"\.attn\.to_k$"), ".attn.wk"),
+    (re.compile(r"\.attn\.to_v$"), ".attn.wv"),
+    (re.compile(r"\.attn\.to_gate$"), ".attn.gate"),
+    (re.compile(r"\.attn\.to_out\.0$"), ".attn.wo"),
+    (re.compile(r"\.ff\.(gate|up|down)$"), r".mlp.\1"),
+)
+
+
+def _diffusers_to_krea2_name(name: str) -> str:
+    for pattern, repl in _DIFFUSERS_TO_KREA2:
+        name = pattern.sub(repl, name)
+    return name
+
+
+def _build_sample_lora_delta(parts: dict):
+    """Turn one module's sample-lora tensors into (delta_fn, format, (out, in)).
+
+    delta_fn(x) returns the unscaled-by-multiplier output delta for input x.
+    Supports kohya/peft lora pairs, LyCORIS LoKr (linear) and full weight diffs,
+    with ComfyUI's scaling conventions. Returns None if the parts are unusable."""
+    alpha = float(parts["alpha"]) if "alpha" in parts else None
+
+    if "down" in parts and "up" in parts:
+        down, up = parts["down"], parts["up"]
+        rank = down.shape[0]
+        scale = ((alpha if alpha is not None else rank) / rank) if rank else 1.0
+
+        def lora_delta(x):
+            d = F.linear(x, down.to(x.device, x.dtype))
+            return F.linear(d, up.to(x.device, x.dtype)) * scale
+
+        return lora_delta, "lora", (up.shape[0], down.shape[1])
+
+    def lokr_factor(i):
+        if f"lokr_w{i}" in parts:
+            return parts[f"lokr_w{i}"]
+        if f"lokr_w{i}_a" in parts and f"lokr_w{i}_b" in parts:
+            return parts[f"lokr_w{i}_a"].float() @ parts[f"lokr_w{i}_b"].float()
+        return None
+
+    # lokr_t2 is the tucker (conv) variant; the hooked modules are all linear
+    w1, w2 = lokr_factor(1), lokr_factor(2)
+    if w1 is not None and w2 is not None and "lokr_t2" not in parts:
+        if w1.ndim != 2 or w2.ndim != 2:
+            return None
+        # alpha only rescales a low-rank-decomposed factor (ComfyUI convention)
+        if "lokr_w2_b" in parts:
+            dim = parts["lokr_w2_b"].shape[0]
+        elif "lokr_w1_b" in parts:
+            dim = parts["lokr_w1_b"].shape[0]
+        else:
+            dim = None
+        scale = alpha / dim if (alpha is not None and dim) else 1.0
+        (a1, a2), (b1, b2) = w1.shape, w2.shape
+
+        def lokr_delta(x):
+            # kron(w1, w2) @ x == vec(w1 @ X @ w2.T) with X = x viewed as (a2, b2),
+            # without materializing the full (a1*b1, a2*b2) weight
+            lead = x.shape[:-1]
+            xm = x.reshape(*lead, a2, b2)
+            y = torch.matmul(
+                torch.matmul(w1.to(x.device, x.dtype), xm),
+                w2.to(x.device, x.dtype).T,
+            )
+            return y.reshape(*lead, a1 * b1) * scale
+
+        return lokr_delta, "lokr", (a1 * b1, a2 * b2)
+
+    if "diff" in parts and parts["diff"].ndim == 2:
+        diff, diff_b = parts["diff"], parts.get("diff_b")
+
+        def diff_delta(x):
+            b = diff_b.to(x.device, x.dtype) if diff_b is not None else None
+            return F.linear(x, diff.to(x.device, x.dtype), b)
+
+        return diff_delta, "diff", tuple(diff.shape)
+
+    return None
 
 
 class Krea2Model(QwenImageVAEHolderMixin, BaseModel):
@@ -471,7 +557,7 @@ class Krea2Model(QwenImageVAEHolderMixin, BaseModel):
             "lora_transformer_", "lora_unet_", "lora_",
         )
 
-        def resolve(core: str):
+        def lookup(core: str):
             if core in mods:
                 return core
             if core in und:
@@ -488,58 +574,70 @@ class Krea2Model(QwenImageVAEHolderMixin, BaseModel):
                         return und[cu]
             return None
 
-        _DOWN = (".lora_down.weight", ".lora_A.weight", ".lora.down.weight")
-        _UP = (".lora_up.weight", ".lora_B.weight", ".lora.up.weight")
-        pairs, alphas = {}, {}
+        def resolve(core: str):
+            nm = lookup(core)
+            if nm is None:
+                translated = _diffusers_to_krea2_name(core)
+                if translated != core:
+                    nm = lookup(translated)
+            return nm
+
+        # key suffix -> part: kohya/peft lora pairs, LyCORIS LoKr, and full diffs
+        _SUFFIXES = (
+            (".lora_down.weight", "down"), (".lora_A.weight", "down"),
+            (".lora.down.weight", "down"),
+            (".lora_up.weight", "up"), (".lora_B.weight", "up"),
+            (".lora.up.weight", "up"),
+            (".lokr_w1", "lokr_w1"), (".lokr_w1_a", "lokr_w1_a"),
+            (".lokr_w1_b", "lokr_w1_b"),
+            (".lokr_w2", "lokr_w2"), (".lokr_w2_a", "lokr_w2_a"),
+            (".lokr_w2_b", "lokr_w2_b"),
+            (".lokr_t2", "lokr_t2"),
+            (".diff", "diff"), (".diff_b", "diff_b"),
+            (".alpha", "alpha"),
+        )
+        parts_by_module = {}
         for k, v in raw_sd.items():
-            slot = suf = None
-            for s in _DOWN:
-                if k.endswith(s):
-                    slot, suf = "down", s
+            for suf, part in _SUFFIXES:
+                if k.endswith(suf):
+                    nm = resolve(k[: -len(suf)])
+                    if nm is not None:
+                        parts_by_module.setdefault(nm, {})[part] = v
                     break
-            if slot is None:
-                for s in _UP:
-                    if k.endswith(s):
-                        slot, suf = "up", s
-                        break
-            if slot is not None:
-                nm = resolve(k[: -len(suf)])
-                if nm is not None:
-                    pairs.setdefault(nm, {})[slot] = v
-            elif k.endswith(".alpha"):
-                nm = resolve(k[: -len(".alpha")])
-                if nm is not None:
-                    try:
-                        alphas[nm] = float(v)
-                    except Exception:  # noqa: BLE001
-                        pass
 
         handle = {"multiplier": 0.0, "active": False, "handles": [], "matched": 0}
 
-        def make_hook(down, up, scale):
+        def make_hook(delta_fn):
             def hook(module, inputs, output):
                 if not handle["active"] or handle["multiplier"] == 0.0:
                     return output
-                x = inputs[0]
-                d = F.linear(x, down.to(x.device, x.dtype))
-                delta = F.linear(d, up.to(x.device, x.dtype))
-                return output + delta * (scale * handle["multiplier"])
+                return output + delta_fn(inputs[0]) * handle["multiplier"]
             return hook
 
-        for nm, parts in pairs.items():
-            if "down" not in parts or "up" not in parts:
+        formats, skipped = {}, []
+        for nm, parts in parts_by_module.items():
+            built = _build_sample_lora_delta(parts)
+            if built is None:
+                skipped.append(nm)
                 continue
-            down, up = parts["down"], parts["up"]
-            rank = down.shape[0]
-            scale = (float(alphas.get(nm, rank)) / float(rank)) if rank else 1.0
-            h = mods[nm].register_forward_hook(make_hook(down, up, scale))
+            delta_fn, fmt, (out_f, in_f) = built
+            m = mods[nm]
+            want = (getattr(m, "out_features", out_f), getattr(m, "in_features", in_f))
+            if (out_f, in_f) != want:
+                skipped.append(nm)
+                continue
+            h = m.register_forward_hook(make_hook(delta_fn))
             handle["handles"].append(h)
             handle["matched"] += 1
+            formats[fmt] = formats.get(fmt, 0) + 1
 
+        fmt_str = ", ".join(f"{f}={n}" for f, n in formats.items()) or "none"
         print(
             f"[sample-lora] {name}: hooked {handle['matched']} modules "
-            f"(lora weight pairs={len(pairs)}, keys={len(raw_sd)})"
+            f"({fmt_str}; skipped={len(skipped)}, keys={len(raw_sd)})"
         )
+        if skipped:
+            print(f"[sample-lora] {name}: unusable modules sample={skipped[:4]}")
         if handle["matched"] == 0:
             raise ValueError(
                 f"{name}: no lora keys matched model modules. "
